@@ -1,0 +1,30 @@
+rules:
+  - id: php-insecure-unserialize-direct
+    message: "Direct call to unserialize() with untrusted or unvalidated data"
+    severity: CRITICAL
+    confidence: HIGH
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Replace unserialize() with json_decode() or supply ['allowed_classes' => false]."
+    pattern-either:
+      - pattern: "unserialize($_GET[...])"
+      - pattern: "unserialize($_POST[...])"
+      - pattern: "unserialize($_COOKIE[...])"
+      - pattern: "unserialize($_REQUEST[...])"
+      - pattern: "unserialize(base64_decode(...))"
+      - pattern: "unserialize(file_get_contents(...))"
+    pattern-not:
+      - pattern: "unserialize(..., ['allowed_classes' => false])"
+      - pattern: "unserialize(..., array('allowed_classes' => false))"
+
+  - id: php-unserialize-without-allowed-classes
+    message: "unserialize() called without restricting allowed_classes to false"
+    severity: HIGH
+    confidence: MEDIUM
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Always specify ['allowed_classes' => false] when deserializing untrusted data."
+    pattern: "unserialize($INPUT)"
+    pattern-not:
+      - pattern: "unserialize($INPUT, ['allowed_classes' => false])"
+      - pattern: "unserialize($INPUT, array('allowed_classes' => false))"

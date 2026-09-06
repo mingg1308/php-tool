@@ -1,0 +1,14 @@
+rules:
+  - id: php-unserialize-cookie-session
+    message: "Insecure Deserialization of Cookie or Session state"
+    severity: CRITICAL
+    confidence: HIGH
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Never store serialized PHP objects in cookies without cryptographic signature (HMAC) or migrate to JSON."
+    pattern-either:
+      - pattern: "unserialize($_COOKIE[...])"
+      - pattern: "unserialize(base64_decode($_COOKIE[...]))"
+      - pattern: "unserialize(urldecode($_COOKIE[...]))"
+      - pattern: "unserialize(gzuncompress($_COOKIE[...]))"
+      - pattern: "unserialize(gzinflate($_COOKIE[...]))"

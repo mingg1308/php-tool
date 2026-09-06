@@ -1,0 +1,33 @@
+rules:
+  - id: php-magic-destruct-dangerous-sink
+    message: "Magic method __destruct() executes dangerous function or dynamic call"
+    severity: CRITICAL
+    confidence: HIGH
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Avoid performing dynamic evaluation, command execution, or dynamic property calls in __destruct()."
+    pattern-inside: "function __destruct(...) { ... }"
+    pattern-either:
+      - pattern: "eval(...)"
+      - pattern: "system(...)"
+      - pattern: "exec(...)"
+      - pattern: "passthru(...)"
+      - pattern: "call_user_func(...)"
+      - pattern: "call_user_func_array(...)"
+      - pattern: "file_put_contents(...)"
+      - pattern: "unlink(...)"
+
+  - id: php-magic-wakeup-dangerous-sink
+    message: "Magic method __wakeup() executes dangerous function or dynamic call"
+    severity: CRITICAL
+    confidence: HIGH
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Do not execute unvalidated logic or side-effects inside __wakeup()."
+    pattern-inside: "function __wakeup(...) { ... }"
+    pattern-either:
+      - pattern: "eval(...)"
+      - pattern: "system(...)"
+      - pattern: "exec(...)"
+      - pattern: "call_user_func(...)"
+      - pattern: "file_put_contents(...)"

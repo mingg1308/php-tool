@@ -1,0 +1,43 @@
+name: SAST CI Pipeline
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify YAML rules syntax
+        run: |
+          python -m php_deserial_sast.cli verify-rules
+
+      - name: Run automated test suite
+        run: |
+          python -m pytest tests/ -v
+
+      - name: Test scan execution on test samples
+        run: |
+          python -m php_deserial_sast.cli scan test_samples/ --format json --output report.json
+          python -m php_deserial_sast.cli scan test_samples/ --format sarif --output report.sarif

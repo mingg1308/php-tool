@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "php-deserial-sast"
+version = "1.0.0"
+description = "Automated PHP Insecure Deserialization & POP Gadget Chain SAST Scanner"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Security Research Team" }]
+license = { text = "MIT" }
+dependencies = [
+    "tree-sitter>=0.24.0",
+    "tree-sitter-php>=0.23.0",
+    "pyyaml>=6.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "click>=8.0.0",
+    "jinja2>=3.1.0",
+    "networkx>=3.0",
+    "httpx>=0.24.0",
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+php-deserial-sast = "php_deserial_sast.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["php_deserial_sast*"]

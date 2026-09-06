@@ -1,0 +1,23 @@
+rules:
+  - id: php-phar-filesystem-deserialization
+    message: "Potential Phar Deserialization trigger via filesystem operation with user-controlled input"
+    severity: HIGH
+    confidence: HIGH
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Filter out 'phar://' stream wrapper and validate path using basename() or strict whitelist."
+    pattern-either:
+      - pattern: "file_exists($_GET[...])"
+      - pattern: "file_exists($_POST[...])"
+      - pattern: "is_file($_GET[...])"
+      - pattern: "is_file($_POST[...])"
+      - pattern: "file_get_contents($_GET[...])"
+      - pattern: "file_get_contents($_POST[...])"
+      - pattern: "copy($_GET[...], ...)"
+      - pattern: "copy($_POST[...], ...)"
+      - pattern: "unlink($_GET[...])"
+      - pattern: "unlink($_POST[...])"
+      - pattern: "exif_read_data($_GET[...])"
+      - pattern: "exif_read_data($_POST[...])"
+      - pattern: "include($_GET[...])"
+      - pattern: "require($_GET[...])"
