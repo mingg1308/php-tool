@@ -32,40 +32,53 @@ Công cụ phân tích mã nguồn tĩnh (**Static Application Security Testing 
 
 ## 🏗️ Kiến trúc Hệ thống
 
-```
-+-----------------------------------------------------------------------------------+
-|                                 CLI Interface                                     |
-|                       (scan, find-gadgets, verify-rules)                          |
-+-----------------------------------------------------------------------------------+
-                                         │
-                                         ▼
-+-----------------------------------------------------------------------------------+
-|                              Core Parser (Tree-sitter)                            |
-|             Symbol Table • Class Hierarchy • Call Graph & Dynamic Dispatch        |
-+-----------------------------------------------------------------------------------+
-                                         │
-         ┌───────────────────────────────┼───────────────────────────────┐
-         ▼                               ▼                               ▼
-+-------------------+           +-------------------+           +-------------------+
-|   Taint Engine    |           |    Rule Engine    |           |   Gadget Finder   |
-| (Source -> Sink)  |           |   (Semgrep-like)  |           | (POP Chain DFS)   |
-+-------------------+           +-------------------+           +-------------------+
-         │                               │                               │
-         └───────────────────────────────┼───────────────────────────────┘
-                                         ▼
-+-----------------------------------------------------------------------------------+
-|                        Aggregator & Deduplication Filter                          |
-+-----------------------------------------------------------------------------------+
-                                         │
-                                         ▼
-+-----------------------------------------------------------------------------------+
-|                      LLM Verification (OpenAI / Gemini / Ollama)                   |
-+-----------------------------------------------------------------------------------+
-                                         │
-                                         ▼
-+-----------------------------------------------------------------------------------+
-|                      Reporters (Console, SARIF, HTML, JSON)                       |
-+-----------------------------------------------------------------------------------+
+```mermaid
+flowchart TD
+    subgraph S1 ["1. ĐẦU VÀO (INPUT)"]
+        INPUT_PHP["Mã nguồn PHP mục tiêu"]
+        INPUT_RULE["Tập luật YAML (Semgrep-like)"]
+    end
+
+    subgraph S2 ["2. PHÂN TÍCH CÚ PHÁP & ĐỒ THỊ (CORE PARSER & GRAPH)"]
+        ORCHESTRATOR["Bộ điều phối & CLI (Scanner Orchestrator)"]
+        PARSER["Bộ phân tích cú pháp Tree-sitter PHP (Sinh cây AST)"]
+        SYMBOL["Bảng ký hiệu dự án (Symbol Table & Class Hierarchy)"]
+        GRAPH["Đồ thị gọi hàm liên thủ tục (Inter-procedural Call Graph)"]
+        
+        ORCHESTRATOR --> PARSER --> SYMBOL --> GRAPH
+    end
+
+    INPUT_PHP --> ORCHESTRATOR
+    INPUT_RULE --> ORCHESTRATOR
+
+    subgraph S3 ["3. ĐỘNG CƠ PHÂN TÍCH BẢO MẬT (SECURITY ENGINES)"]
+        direction LR
+        TAINT["Động cơ Taint Analysis\n(Truy vết Source -> Sink)"]
+        GADGET["Động cơ POP Gadget Finder\n(Duyệt DFS tìm chuỗi khai thác)"]
+        RULE["Động cơ Rule Engine\n(So khớp mẫu cú pháp YAML)"]
+    end
+
+    GRAPH --> TAINT
+    GRAPH --> GADGET
+    SYMBOL --> RULE
+
+    subgraph S4 ["4. KHỬ TRÙNG LẶP & THẨM ĐỊNH AI (POST-PROCESSING)"]
+        DEDUP["Bộ lọc khử trùng lặp & Tương quan chéo (Deduplication)"]
+        LLM["Thẩm định bằng AI (LLM Verification: OpenAI / Gemini / Ollama)"]
+        
+        DEDUP -->|Lọc False Positives| LLM
+    end
+
+    TAINT --> DEDUP
+    GADGET --> DEDUP
+    RULE --> DEDUP
+
+    subgraph S5 ["5. ĐẦU RA BÁO CÁO (OUTPUT REPORTERS)"]
+        REPORTS["Báo cáo đa định dạng\n(Interactive HTML | OASIS SARIF | Rich Console | JSON)"]
+    end
+
+    LLM --> REPORTS
+    DEDUP -.->|Không dùng LLM| REPORTS
 ```
 
 ---

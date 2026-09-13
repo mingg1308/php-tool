@@ -23,9 +23,19 @@ dependencies = [
     "pytest>=7.0.0",
 ]
 
+[project.optional-dependencies]
+llm = [
+    "openai>=1.0.0",
+    "google-generativeai>=0.8.0",
+]
+
 [project.scripts]
 php-deserial-sast = "php_deserial_sast.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["php_deserial_sast*"]
+
+[tool.pytest.ini_options]
+addopts = "-p no:cacheprovider"
+

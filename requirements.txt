@@ -8,3 +8,8 @@ jinja2>=3.1.0
 networkx>=3.0
 httpx>=0.24.0
 pytest>=7.0.0
+
+# LLM-assisted Verification (OpenAI / Gemini / Ollama)
+openai>=1.0.0
+google-generativeai>=0.8.0
+
