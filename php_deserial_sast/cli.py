@@ -13,7 +13,9 @@ if sys.platform == "win32":
         pass
 
 import click
+# pyrefly: ignore [missing-import]
 from rich.console import Console
+# pyrefly: ignore [missing-import]
 from rich.table import Table
 
 from php_deserial_sast.config import ScannerConfig, DEFAULT_BUILTIN_RULES_DIR
