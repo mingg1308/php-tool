@@ -9,6 +9,7 @@ from php_deserial_sast.config import ScannerConfig
 from php_deserial_sast.models import (
     ScanResult,
     ScanSummary,
+    ScanError,
     Finding,
     GadgetChain,
     Severity,
@@ -49,23 +50,32 @@ class PHPDeserializationScanner:
     def scan(self) -> ScanResult:
         """Run the complete multi-phase static analysis scan."""
         start_time = time.time()
-        php_files = self._collect_php_files(self.config.target_path)
+        # A scanner instance may be reused. Reset project state so symbols and
+        # taint summaries from a previous target cannot leak into this scan.
+        self.symbol_table = ProjectSymbolTable()
+        if self.llm_verifier:
+            self.llm_verifier.slicer.symbol_table = self.symbol_table
+        php_files = sorted(self._collect_php_files(self.config.target_path))
         
         parsed_files: Dict[str, Tuple[Any, bytes]] = {}
         total_lines = 0
+        errors: List[ScanError] = []
+        if self.rule_engine:
+            errors.extend(
+                ScanError(file_path=path, phase="rule_load", message=message)
+                for path, message in self.rule_engine.load_errors
+            )
 
         # Phase 1: Parse all files and populate Symbol Table
         for file_path in php_files:
             try:
                 root_node, source_bytes = self.parser.parse_file(file_path)
-                parsed_files[file_path] = (root_node, source_bytes)
-                total_lines += len(source_bytes.splitlines())
-
                 visitor = ASTVisitor(self.symbol_table, file_path, source_bytes)
                 visitor.extract_all(root_node)
+                parsed_files[file_path] = (root_node, source_bytes)
+                total_lines += len(source_bytes.splitlines())
             except Exception as e:
-                # Fault tolerance for single unparseable files
-                pass
+                errors.append(ScanError(file_path=file_path, phase="parse", message=str(e)))
 
         # Phase 2: Build Call Graph & Collect Inter-procedural Taint Summaries
         call_graph = CallGraph(self.symbol_table)
@@ -75,8 +85,8 @@ class PHPDeserializationScanner:
                 try:
                     t_prep = TaintEngine(file_path, source_bytes, root_node, self.symbol_table)
                     t_prep.collect_function_summaries()
-                except Exception:
-                    pass
+                except Exception as e:
+                    errors.append(ScanError(file_path=file_path, phase="taint_summary", message=str(e)))
 
         all_findings: List[Finding] = []
         gadget_chains: List[GadgetChain] = []
@@ -92,14 +102,18 @@ class PHPDeserializationScanner:
         for file_path, (root_node, source_bytes) in parsed_files.items():
             # Taint Engine
             if self.config.enable_taint:
-                taint_engine = TaintEngine(file_path, source_bytes, root_node, self.symbol_table)
-                taint_findings = taint_engine.analyze()
-                all_findings.extend(taint_findings)
+                try:
+                    taint_engine = TaintEngine(file_path, source_bytes, root_node, self.symbol_table)
+                    all_findings.extend(taint_engine.analyze())
+                except Exception as e:
+                    errors.append(ScanError(file_path=file_path, phase="taint", message=str(e)))
 
             # Rule Engine
             if self.rule_engine:
-                rule_findings = self.rule_engine.evaluate_file(file_path, source_bytes, root_node)
-                all_findings.extend(rule_findings)
+                try:
+                    all_findings.extend(self.rule_engine.evaluate_file(file_path, source_bytes, root_node))
+                except Exception as e:
+                    errors.append(ScanError(file_path=file_path, phase="rules", message=str(e)))
 
         # Phase 4: Deduplicate and Filter
         unique_findings = self._deduplicate_findings(all_findings)
@@ -116,11 +130,19 @@ class PHPDeserializationScanner:
                     verdict = self.llm_verifier.verify_finding(finding)
                     if verdict:
                         finding.llm_verification = verdict
+                    elif self.llm_verifier.last_error:
+                        errors.append(ScanError(
+                            file_path=finding.location.file_path,
+                            phase="llm",
+                            message=self.llm_verifier.last_error,
+                        ))
 
         # Phase 6: Build Summary & Result
         duration = time.time() - start_time
         summary = self._create_summary(
-            total_files=len(php_files),
+            total_files=len(parsed_files),
+            discovered_files=len(php_files),
+            files_with_errors=len({error.file_path for error in errors}),
             total_lines=total_lines,
             findings=filtered_findings,
             chains_count=len(gadget_chains),
@@ -134,7 +156,8 @@ class PHPDeserializationScanner:
             summary=summary,
             findings=filtered_findings,
             gadget_chains=gadget_chains,
-            all_classes=all_class_names
+            all_classes=all_class_names,
+            errors=errors
         )
 
     def _collect_php_files(self, target_path: str) -> List[str]:
@@ -242,11 +265,22 @@ class PHPDeserializationScanner:
                 seen_keys.add(key)
                 final_findings.append(f)
 
-        return final_findings
+        return sorted(
+            final_findings,
+            key=lambda f: (
+                -f.severity.rank,
+                os.path.normcase(os.path.normpath(f.location.file_path)),
+                f.location.start_line,
+                f.location.start_col,
+                f.rule_id,
+            ),
+        )
 
     def _create_summary(
         self,
         total_files: int,
+        discovered_files: int,
+        files_with_errors: int,
         total_lines: int,
         findings: List[Finding],
         chains_count: int,
@@ -262,7 +296,9 @@ class PHPDeserializationScanner:
         total_methods = sum(len(c.methods) for c in self.symbol_table.get_all_unique_classes())
 
         return ScanSummary(
+            total_files_discovered=discovered_files,
             total_files_scanned=total_files,
+            files_with_errors=files_with_errors,
             total_lines_scanned=total_lines,
             total_classes_found=unique_classes,
             total_methods_found=total_methods,

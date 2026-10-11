@@ -2,6 +2,7 @@
 Dataflow and Taint Analysis Engine for PHP Insecure Deserialization and Phar vulnerabilities.
 """
 
+import re
 from typing import List, Dict, Set, Tuple, Optional, Any, TYPE_CHECKING
 from tree_sitter import Node
 from php_deserial_sast.core.parser import (
@@ -56,6 +57,7 @@ class TaintEngine:
         self.symbol_table = symbol_table
         # Variable name -> List of TaintSteps
         self.tainted_vars: Dict[str, List[TaintStep]] = {}
+        self.known_clean_vars: Set[str] = set()
         # Variables holding phar prefix
         self.phar_prefix_vars: Set[str] = set()
 
@@ -388,19 +390,47 @@ class TaintEngine:
                     variable_name=var_name
                 )
                 self.tainted_vars[var_name] = steps + [assign_step]
+                self.known_clean_vars.discard(var_name)
             else:
                 # If variable was reassigned a safe constant/sanitized value, untaint it
                 if var_name in self.tainted_vars and not any(sg in right_text for sg in SOURCES_SUPERGLOBALS):
                     if var_name not in right_text:
                         del self.tainted_vars[var_name]
+                if self._is_definitely_clean_expression(right_node):
+                    self.known_clean_vars.add(var_name)
+                else:
+                    self.known_clean_vars.discard(var_name)
+
+    def _is_definitely_clean_expression(self, node: Node) -> bool:
+        """Return true only for expressions that cannot carry request data."""
+        if node.type in {
+            "string", "encapsed_string", "integer", "float", "boolean",
+            "null", "array_creation_expression",
+        }:
+            # Interpolated strings can still contain variables.
+            if node.type == "encapsed_string":
+                return not any(child.type in ("variable_name", "subscript_expression") for child in node.children)
+            return True
+        if node.type == "function_call_expression":
+            fn_node = find_child_by_field(node, "function")
+            fn_name = get_node_text(fn_node, self.source_bytes).strip("\\ ") if fn_node else ""
+            return fn_name in SAFE_FUNCTIONS
+        return False
 
     def _is_unserialize_safe(self, call_node: Node) -> bool:
-        """Check if unserialize has allowed_classes => false or safe whitelist."""
-        call_text = get_node_text(call_node, self.source_bytes)
-        if "allowed_classes" in call_text:
-            if "false" in call_text.lower() or "[]" in call_text or "array()" in call_text:
-                return True
-        return False
+        """Check whether the options argument disables object construction."""
+        args_node = find_child_by_field(call_node, "arguments") or find_child_by_type(call_node, "arguments")
+        if not args_node:
+            return False
+        args = [child for child in args_node.children if child.type not in ("(", ")", ",")]
+        if len(args) < 2:
+            return False
+        options_text = get_node_text(args[1], self.source_bytes)
+        return bool(re.search(
+            r"['\"]allowed_classes['\"]\s*=>\s*(?:false\b|\[\s*\]|array\s*\(\s*\))",
+            options_text,
+            flags=re.IGNORECASE,
+        ))
 
     def _check_unserialize_sinks(self) -> List[Finding]:
         """Find calls to unserialize() taking tainted inputs."""
@@ -472,7 +502,8 @@ class TaintEngine:
                 findings.append(finding)
             else:
                 arg_text = get_node_text(first_arg, self.source_bytes).strip()
-                if arg_text.startswith("$"):
+                var_name = arg_text.split("[")[0].strip()
+                if arg_text.startswith("$") and var_name not in self.known_clean_vars:
                     finding = Finding(
                         id=f"DESERIAL-SUSPICIOUS-{loc.start_line}",
                         rule_id="php-unserialize-potential-taint",

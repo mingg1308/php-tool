@@ -15,6 +15,14 @@ SEVERITY_TO_SARIF_LEVEL = {
     Severity.INFO: "none",
 }
 
+SEVERITY_TO_SECURITY_SCORE = {
+    Severity.CRITICAL: "9.8",
+    Severity.HIGH: "8.0",
+    Severity.MEDIUM: "5.5",
+    Severity.LOW: "3.0",
+    Severity.INFO: "0.0",
+}
+
 
 class SarifReporter:
     """Generates standard SARIF v2.1.0 JSON reports."""
@@ -44,8 +52,13 @@ class SarifReporter:
                         "markdown": f"### Remediation\n{finding.remediation}" if finding.remediation else finding.description
                     },
                     "properties": {
-                        "tags": ["security", "cwe-502", "insecure-deserialization", "php"],
-                        "security-severity": "9.8" if finding.severity == Severity.CRITICAL else "7.5"
+                        "tags": [
+                            "security",
+                            (finding.cwe or "cwe-502").split(":", 1)[0].lower(),
+                            "insecure-deserialization",
+                            "php",
+                        ],
+                        "security-severity": SEVERITY_TO_SECURITY_SCORE[finding.severity],
                     }
                 }
 
@@ -82,6 +95,20 @@ class SarifReporter:
                             "message": {"text": step.description}
                         }
                     })
+            elif finding.gadget_chain:
+                for step in finding.gadget_chain.steps:
+                    thread_flow_locations.append({
+                        "location": {
+                            "physicalLocation": {
+                                "artifactLocation": {"uri": step.location.file_path.replace("\\", "/")},
+                                "region": {
+                                    "startLine": step.location.start_line,
+                                    "startColumn": step.location.start_col,
+                                },
+                            },
+                            "message": {"text": step.description},
+                        }
+                    })
 
             if thread_flow_locations:
                 res_item["codeFlows"] = [{
@@ -101,7 +128,6 @@ class SarifReporter:
                         "driver": {
                             "name": self.scanner_name,
                             "version": self.version,
-                            "informationUri": "https://github.com/ambionics/phpggc",
                             "rules": list(rules_map.values())
                         }
                     },

@@ -4,7 +4,7 @@ Data models and definitions for PHP Insecure Deserialization SAST Scanner.
 
 from enum import Enum
 from typing import List, Dict, Optional, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 
 class Severity(str, Enum):
@@ -88,8 +88,8 @@ class GadgetChain(BaseModel):
 
 
 class LLMVerificationResult(BaseModel):
-    is_vulnerable: bool
-    confidence_score: float  # 0.0 to 1.0
+    is_vulnerable: StrictBool
+    confidence_score: float = Field(ge=0.0, le=1.0)
     reasoning: str
     exploitability_assessment: str
     prerequisites: List[str] = Field(default_factory=list)
@@ -117,7 +117,9 @@ class Finding(BaseModel):
 
 
 class ScanSummary(BaseModel):
+    total_files_discovered: int = 0
     total_files_scanned: int = 0
+    files_with_errors: int = 0
     total_lines_scanned: int = 0
     total_classes_found: int = 0
     total_methods_found: int = 0
@@ -131,9 +133,16 @@ class ScanSummary(BaseModel):
     scan_duration_seconds: float = 0.0
 
 
+class ScanError(BaseModel):
+    file_path: str
+    phase: str
+    message: str
+
+
 class ScanResult(BaseModel):
     target_path: str
     summary: ScanSummary
     findings: List[Finding]
     gadget_chains: List[GadgetChain] = Field(default_factory=list)
     all_classes: List[str] = Field(default_factory=list)
+    errors: List[ScanError] = Field(default_factory=list)

@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1840" viewBox="0 0 1600 1840">
+  <defs>
+    <style>
+      .title { font: 700 34px Arial, sans-serif; fill: #172033; }
+      .section { font: 700 20px Arial, sans-serif; fill: #42526e; letter-spacing: 1px; }
+      .head { font: 700 20px Arial, sans-serif; fill: #172033; }
+      .body { font: 16px Arial, sans-serif; fill: #344054; }
+      .small { font: 14px Arial, sans-serif; fill: #475467; }
+      .box { stroke: #667085; stroke-width: 2; rx: 14; }
+      .arrow { stroke: #344054; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .error { stroke: #d92d20; stroke-width: 2.5; stroke-dasharray: 9 7; fill: none; marker-end: url(#redArrow); }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#344054"/>
+    </marker>
+    <marker id="redArrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#d92d20"/>
+    </marker>
+  </defs>
+
+  <rect width="1600" height="1840" fill="#ffffff"/>
+  <text x="800" y="55" text-anchor="middle" class="title">LUỒNG HOẠT ĐỘNG CỦA CÔNG CỤ PHP DESERIALIZATION SAST</text>
+
+  <text x="65" y="112" class="section">1. TIẾP NHẬN VÀ CẤU HÌNH</text>
+  <rect x="80" y="140" width="310" height="115" class="box" fill="#eaf2ff"/>
+  <text x="235" y="183" text-anchor="middle" class="head">Người dùng / CI</text>
+  <text x="235" y="215" text-anchor="middle" class="body">Lệnh quét và thư mục dự án</text>
+
+  <rect x="500" y="140" width="310" height="115" class="box" fill="#eaf2ff"/>
+  <text x="655" y="183" text-anchor="middle" class="head">CLI</text>
+  <text x="655" y="215" text-anchor="middle" class="body">Kiểm tra tham số đầu vào</text>
+
+  <rect x="920" y="140" width="590" height="115" class="box" fill="#eaf2ff"/>
+  <text x="1215" y="179" text-anchor="middle" class="head">ScannerConfig</text>
+  <text x="1215" y="209" text-anchor="middle" class="body">Đường dẫn • mức nghiêm trọng • định dạng báo cáo</text>
+  <text x="1215" y="235" text-anchor="middle" class="small">Tùy chọn LLM, loại trừ và giới hạn phân tích</text>
+  <path d="M390 198 H490" class="arrow"/>
+  <path d="M810 198 H910" class="arrow"/>
+
+  <text x="65" y="326" class="section">2. PHÂN TÍCH MÃ NGUỒN VÀ XÂY DỰNG TRI THỨC</text>
+  <rect x="80" y="355" width="275" height="105" class="box" fill="#ecfdf3"/>
+  <text x="217" y="397" text-anchor="middle" class="head">Thu thập tệp PHP</text>
+  <text x="217" y="428" text-anchor="middle" class="body">Duyệt dự án và áp dụng loại trừ</text>
+
+  <rect x="440" y="355" width="275" height="105" class="box" fill="#ecfdf3"/>
+  <text x="577" y="397" text-anchor="middle" class="head">PHPParser</text>
+  <text x="577" y="428" text-anchor="middle" class="body">Chuyển mã nguồn thành AST</text>
+
+  <rect x="800" y="355" width="275" height="105" class="box" fill="#ecfdf3"/>
+  <text x="937" y="397" text-anchor="middle" class="head">ASTVisitor</text>
+  <text x="937" y="428" text-anchor="middle" class="body">Trích xuất cấu trúc và lời gọi</text>
+
+  <rect x="1160" y="355" width="350" height="105" class="box" fill="#ecfdf3"/>
+  <text x="1335" y="397" text-anchor="middle" class="head">ProjectSymbolTable</text>
+  <text x="1335" y="428" text-anchor="middle" class="body">Lớp, hàm, phương thức và quan hệ kế thừa</text>
+  <path d="M217 255 V345" class="arrow"/>
+  <path d="M355 408 H430" class="arrow"/>
+  <path d="M715 408 H790" class="arrow"/>
+  <path d="M1075 408 H1150" class="arrow"/>
+
+  <rect x="520" y="535" width="560" height="105" class="box" fill="#ecfdf3"/>
+  <text x="800" y="577" text-anchor="middle" class="head">CallGraph và tóm tắt liên thủ tục</text>
+  <text x="800" y="608" text-anchor="middle" class="body">Liên kết lời gọi, định danh đầy đủ và dòng dữ liệu giữa các hàm</text>
+  <path d="M1335 460 V500 H800 V525" class="arrow"/>
+
+  <text x="65" y="711" class="section">3. CÁC BỘ MÁY PHÁT HIỆN</text>
+  <rect x="80" y="740" width="420" height="165" class="box" fill="#fff7e8"/>
+  <text x="290" y="783" text-anchor="middle" class="head">TaintEngine</text>
+  <text x="290" y="818" text-anchor="middle" class="body">Theo dõi Source → Propagation → Sink</text>
+  <text x="290" y="849" text-anchor="middle" class="body">qua biến, thuộc tính và lời gọi hàm</text>
+  <text x="290" y="880" text-anchor="middle" class="small">Phát hiện luồng dữ liệu không an toàn</text>
+
+  <rect x="590" y="740" width="420" height="165" class="box" fill="#fff7e8"/>
+  <text x="800" y="783" text-anchor="middle" class="head">RuleEngine</text>
+  <text x="800" y="818" text-anchor="middle" class="body">Đối chiếu mẫu nguy hiểm</text>
+  <text x="800" y="849" text-anchor="middle" class="body">và các API nhạy cảm</text>
+  <text x="800" y="880" text-anchor="middle" class="small">Sinh phát hiện theo luật tĩnh</text>
+
+  <rect x="1100" y="740" width="410" height="165" class="box" fill="#fff7e8"/>
+  <text x="1305" y="783" text-anchor="middle" class="head">GadgetFinder</text>
+  <text x="1305" y="818" text-anchor="middle" class="body">Tìm magic methods và gadget</text>
+  <text x="1305" y="849" text-anchor="middle" class="body">Ghép chuỗi POP khả nghi</text>
+  <text x="1305" y="880" text-anchor="middle" class="small">Đánh giá đường đi tới sink</text>
+  <path d="M800 640 V690 H290 V730" class="arrow"/>
+  <path d="M800 640 V730" class="arrow"/>
+  <path d="M800 640 V690 H1305 V730" class="arrow"/>
+
+  <text x="65" y="980" class="section">4. TỔNG HỢP VÀ XÁC MINH KẾT QUẢ</text>
+  <rect x="100" y="1010" width="320" height="115" class="box" fill="#f4ebff"/>
+  <text x="260" y="1053" text-anchor="middle" class="head">Hợp nhất phát hiện</text>
+  <text x="260" y="1084" text-anchor="middle" class="body">Taint • Rule • Gadget chain</text>
+
+  <rect x="490" y="1010" width="320" height="115" class="box" fill="#f4ebff"/>
+  <text x="650" y="1053" text-anchor="middle" class="head">Khử trùng lặp</text>
+  <text x="650" y="1084" text-anchor="middle" class="body">Tương quan và chuẩn hóa</text>
+
+  <rect x="880" y="1010" width="300" height="115" class="box" fill="#f4ebff"/>
+  <text x="1030" y="1053" text-anchor="middle" class="head">Lọc severity</text>
+  <text x="1030" y="1084" text-anchor="middle" class="body">Theo ngưỡng cấu hình</text>
+
+  <rect x="1250" y="1010" width="260" height="115" class="box" fill="#f4ebff"/>
+  <text x="1380" y="1053" text-anchor="middle" class="head">LLM tùy chọn</text>
+  <text x="1380" y="1084" text-anchor="middle" class="body">Rà soát High/Critical</text>
+  <path d="M290 905 V965 H260 V1000" class="arrow"/>
+  <path d="M800 905 V965 H260 V1000" class="arrow"/>
+  <path d="M1305 905 V965 H260 V1000" class="arrow"/>
+  <path d="M420 1068 H480" class="arrow"/>
+  <path d="M810 1068 H870" class="arrow"/>
+  <path d="M1180 1068 H1240" class="arrow"/>
+
+  <text x="65" y="1204" class="section">5. KẾT QUẢ VÀ ĐẦU RA</text>
+  <rect x="435" y="1235" width="730" height="130" class="box" fill="#e9f7fb"/>
+  <text x="800" y="1278" text-anchor="middle" class="head">ScanResult</text>
+  <text x="800" y="1311" text-anchor="middle" class="body">Summary • Findings • Gadget chains • Scan errors • Metadata</text>
+  <text x="800" y="1340" text-anchor="middle" class="small">Kết quả thống nhất được chuyển cho các bộ xuất báo cáo</text>
+  <path d="M1380 1125 V1170 H800 V1225" class="arrow"/>
+
+  <rect x="75" y="1460" width="300" height="100" class="box" fill="#eef4ff"/>
+  <text x="225" y="1502" text-anchor="middle" class="head">ConsoleReporter</text>
+  <text x="225" y="1533" text-anchor="middle" class="body">Hiển thị tại terminal</text>
+  <rect x="460" y="1460" width="300" height="100" class="box" fill="#eef4ff"/>
+  <text x="610" y="1502" text-anchor="middle" class="head">JSONReporter</text>
+  <text x="610" y="1533" text-anchor="middle" class="body">Dữ liệu có cấu trúc</text>
+  <rect x="845" y="1460" width="300" height="100" class="box" fill="#eef4ff"/>
+  <text x="995" y="1502" text-anchor="middle" class="head">SARIFReporter</text>
+  <text x="995" y="1533" text-anchor="middle" class="body">Tích hợp CI và GitHub</text>
+  <rect x="1230" y="1460" width="300" height="100" class="box" fill="#eef4ff"/>
+  <text x="1380" y="1502" text-anchor="middle" class="head">HTMLReporter</text>
+  <text x="1380" y="1533" text-anchor="middle" class="body">Báo cáo trực quan</text>
+  <path d="M800 1365 V1410 H225 V1450" class="arrow"/>
+  <path d="M800 1365 V1410 H610 V1450" class="arrow"/>
+  <path d="M800 1365 V1410 H995 V1450" class="arrow"/>
+  <path d="M800 1365 V1410 H1380 V1450" class="arrow"/>
+
+  <rect x="345" y="1650" width="910" height="115" class="box" fill="#f9fafb"/>
+  <text x="800" y="1690" text-anchor="middle" class="head">Mã thoát tiến trình</text>
+  <text x="800" y="1725" text-anchor="middle" class="body">0: không có High/Critical   •   1: có High/Critical   •   2: lỗi quét</text>
+  <path d="M225 1560 V1610 H800 V1640" class="arrow"/>
+  <path d="M610 1560 V1610 H800" class="arrow"/>
+  <path d="M995 1560 V1610 H800" class="arrow"/>
+  <path d="M1380 1560 V1610 H800" class="arrow"/>
+
+  <rect x="1220" y="535" width="290" height="105" class="box" fill="#fff0f0" stroke="#d92d20"/>
+  <text x="1365" y="577" text-anchor="middle" class="head" fill="#b42318">ScanError</text>
+  <text x="1365" y="608" text-anchor="middle" class="small">Ghi nhận lỗi theo từng pha</text>
+  <path d="M1080 588 H1210" class="error"/>
+  <path d="M1510 823 H1545 V588 H1520" class="error"/>
+  <path d="M1365 640 V1190 H1130 V1225" class="error"/>
+
+  <text x="800" y="1810" text-anchor="middle" class="small">Nét liền: luồng xử lý chính • Nét đứt đỏ: lỗi được ghi nhận vào kết quả quét</text>
+</svg>

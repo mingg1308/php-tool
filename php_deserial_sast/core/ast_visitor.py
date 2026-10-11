@@ -241,7 +241,7 @@ class ASTVisitor:
 
             method_sym = MethodSymbol(
                 name=method_name,
-                class_name=cls_symbol.name,
+                class_name=cls_symbol.full_name or cls_symbol.name,
                 visibility=visibility,
                 is_static=is_static,
                 parameters=params,

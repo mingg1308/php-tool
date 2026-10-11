@@ -20,7 +20,7 @@ Công cụ phân tích mã nguồn tĩnh (**Static Application Security Testing 
    - Tìm kiếm đường đi từ Magic Methods (`__destruct`, `__wakeup`, `__toString`, `__call`, `__get`, `__invoke`) đến các Dangerous Sinks (`eval`, `system`, `call_user_func`, `file_put_contents`, v.v.).
    - Tạo sơ đồ cây và Blueprint cấu trúc đối tượng khai thác (Payload Blueprint).
 5. **LLM-assisted Verification Module (Tham khảo `llm-sast-scanner`)**:
-   - Trích xuất Code Slice thông minh và gửi đến mô hình LLM (OpenAI `gpt-4o-mini`, Google `gemini-1.5-flash`, hoặc local `ollama`).
+   - Trích xuất Code Slice thông minh và gửi đến mô hình LLM (OpenAI `gpt-4o-mini`, Google `gemini-3.6-flash`, hoặc local `ollama`).
    - Đánh giá khả năng khai thác (Exploitability), loại bỏ False Positive và đề xuất PoC / bản vá sửa lỗi.
 6. **Báo cáo Đa định dạng**:
    - **Rich Terminal Console**: Giao diện dòng lệnh trực quan với bảng màu, highlight code snippet và cây đường đi POP.
@@ -123,7 +123,7 @@ python -m php_deserial_sast.cli scan /path/to/php/project --llm --llm-provider o
 
 # Sử dụng Google Gemini API
 export GEMINI_API_KEY="your-api-key"
-python -m php_deserial_sast.cli scan /path/to/php/project --llm --llm-provider gemini --llm-model gemini-1.5-flash
+python -m php_deserial_sast.cli scan /path/to/php/project --llm --llm-provider gemini --llm-model gemini-3.6-flash
 
 # Sử dụng Ollama Local (Mô hình chạy cục bộ không gửi code ra ngoài)
 python -m php_deserial_sast.cli scan /path/to/php/project --llm --llm-provider ollama --llm-model qwen2.5-coder:7b
@@ -152,30 +152,6 @@ rules:
     pattern: "unserialize($INPUT)"
     pattern-not:
       - pattern: "unserialize($INPUT, ['allowed_classes' => false])"
-```
-
----
-
-## 🧪 Kiểm Thử Tự Động (Test Suite)
-
-Dự án đi kèm bộ unit test toàn diện cho tất cả các thành phần:
-
-```bash
-python -m pytest tests/ -v
-```
-
-Kết quả:
-```
-tests/test_gadget_finder.py::test_pop_gadget_chain_discovery PASSED
-tests/test_parser.py::test_parser_basic PASSED
-tests/test_parser.py::test_ast_visitor_extraction PASSED
-tests/test_reporters.py::test_full_scan_and_reports PASSED
-tests/test_rules.py::test_rule_engine_loading PASSED
-tests/test_rules.py::test_rule_engine_evaluation PASSED
-tests/test_taint.py::test_taint_direct_unserialize PASSED
-tests/test_taint.py::test_taint_safe_allowed_classes PASSED
-tests/test_taint.py::test_taint_phar_deserialization PASSED
-============================== 9 passed in 1.13s ==============================
 ```
 
 ---

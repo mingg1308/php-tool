@@ -4,7 +4,7 @@ Finds exploit paths from Magic Methods to Dangerous Sinks.
 """
 
 from typing import List, Set, Optional, Tuple
-import uuid
+import hashlib
 from php_deserial_sast.core.symbol_table import (
     ProjectSymbolTable,
     ClassSymbol,
@@ -40,7 +40,8 @@ class GadgetFinder:
         for cls in unique_classes:
             entry_methods = cls.get_pop_entry_methods()
             for method_name, method_sym in entry_methods.items():
-                start_node = f"{cls.name}::{method_name}"
+                class_key = cls.full_name or cls.name
+                start_node = f"{class_key}::{method_name}"
                 found_paths = self._search_paths_to_sinks(start_node, depth=0, visited=set())
                 for path in found_paths:
                     chain = self._build_gadget_chain(cls, method_sym, path)
@@ -150,7 +151,12 @@ class GadgetFinder:
 
         # Calculate severity and confidence
         severity = Severity.CRITICAL if sink_category in ("RCE", "DYNAMIC_INVOCATION", "FILE_WRITE") else Severity.HIGH
-        confidence = Confidence.HIGH if len(steps) <= 3 else (Confidence.MEDIUM if len(steps) <= 5 else Confidence.LOW)
+        minimum_edge_confidence = min(edge.confidence for _, edge in path)
+        confidence = (
+            Confidence.HIGH if minimum_edge_confidence >= 0.9
+            else Confidence.MEDIUM if minimum_edge_confidence >= 0.7
+            else Confidence.LOW
+        )
 
         explanation = (
             f"POP Gadget Chain found starting at `{entry_cls.name}::{entry_method.name}()` "
@@ -160,9 +166,16 @@ class GadgetFinder:
 
         blueprint = self._generate_payload_blueprint(steps)
 
+        signature = "|".join(
+            [entry_cls.full_name or entry_cls.name, entry_method.name]
+            + [
+                f"{edge.caller_class}::{edge.caller_method}>{node_key}:{edge.edge_type}:{edge.call_info.location}"
+                for node_key, edge in path
+            ]
+        )
         return GadgetChain(
-            chain_id=str(uuid.uuid4())[:8],
-            entry_class=entry_cls.name,
+            chain_id=hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12],
+            entry_class=entry_cls.full_name or entry_cls.name,
             entry_method=entry_method.name,
             sink_class=sink_cls_name,
             sink_method=sink_method_name,
@@ -193,7 +206,22 @@ class GadgetFinder:
         seen = set()
         unique = []
         for c in chains:
-            sig = (c.entry_class, c.entry_method, c.sink_class, c.sink_method, c.sink_function, c.length)
+            sig = (
+                c.entry_class,
+                c.entry_method,
+                tuple(
+                    (
+                        step.class_name,
+                        step.method_name,
+                        step.step_type,
+                        step.target_class,
+                        step.target_method,
+                        str(step.location),
+                    )
+                    for step in c.steps
+                ),
+                c.sink_function,
+            )
             if sig not in seen:
                 seen.add(sig)
                 unique.append(c)

@@ -72,6 +72,7 @@ class RuleEngine:
     def __init__(self, rules_dir: Optional[str] = None):
         self.matcher = PatternMatcher()
         self.rules: List[Rule] = []
+        self.load_errors: List[Tuple[str, str]] = []
         if rules_dir and os.path.exists(rules_dir):
             self.load_rules_from_dir(rules_dir)
 
@@ -93,7 +94,7 @@ class RuleEngine:
                     rule = Rule(r_data)
                     self.rules.append(rule)
         except Exception as e:
-            print(f"[-] Error loading rule file {file_path}: {e}")
+            self.load_errors.append((file_path, f"{type(e).__name__}: {e}"))
 
     def evaluate_file(self, file_path: str, source_bytes: bytes, root_node: Node) -> List[Finding]:
         """Evaluate all loaded rules against a file's AST with AST subsumption filtering."""

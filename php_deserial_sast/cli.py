@@ -114,6 +114,10 @@ def scan_cmd(
             json_rep.save_to_file(result, output)
             console.print(f"[bold green]✔ Report saved to:[/bold green] {output}")
 
+    # Incomplete scans must not be treated as clean in CI.
+    if result.errors:
+        sys.exit(2)
+
     # Exit code: 1 if critical/high findings, else 0
     if result.summary.critical_count > 0 or result.summary.high_count > 0:
         sys.exit(1)
@@ -145,6 +149,9 @@ def find_gadgets_cmd(target, max_depth):
 def verify_rules_cmd(rules_dir):
     """Validate YAML detection rules syntax and patterns."""
     engine = RuleEngine(rules_dir)
+    if engine.load_errors:
+        details = "\n".join(f"{path}: {message}" for path, message in engine.load_errors)
+        raise click.ClickException(f"Failed to load one or more rule files:\n{details}")
     table = Table(title=f"Loaded YAML Rules from {rules_dir}", border_style="cyan")
     table.add_column("Rule ID", style="bold white")
     table.add_column("Severity", style="bold yellow")

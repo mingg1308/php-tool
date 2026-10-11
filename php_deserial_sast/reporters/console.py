@@ -33,7 +33,15 @@ class ConsoleReporter:
         # Summary Statistics Table
         self._print_summary_table(result)
 
+        if result.errors:
+            self.console.print("[bold yellow]Scan errors:[/bold yellow]")
+            for error in result.errors:
+                self.console.print(f"  {error.file_path} ({error.phase}): {error.message}")
+
         if not result.findings:
+            if result.errors:
+                self.console.print("[yellow]No findings in the files analyzed; scan errors may have affected coverage.[/yellow]")
+                return
             self.console.print(Panel("[bold green]✔ No Insecure Deserialization vulnerabilities detected![/bold green]", border_style="green"))
             return
 
@@ -51,7 +59,9 @@ class ConsoleReporter:
         table.add_column("Value", style="bold white", justify="right")
 
         table.add_row("Target Directory", result.target_path)
+        table.add_row("Files Discovered", str(result.summary.total_files_discovered))
         table.add_row("Files Scanned", str(result.summary.total_files_scanned))
+        table.add_row("Files With Errors", str(result.summary.files_with_errors))
         table.add_row("Lines of Code", str(result.summary.total_lines_scanned))
         table.add_row("Classes Analyzed", str(result.summary.total_classes_found))
         table.add_row("Methods Analyzed", str(result.summary.total_methods_found))

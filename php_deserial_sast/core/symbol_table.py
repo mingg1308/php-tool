@@ -106,14 +106,24 @@ class ProjectSymbolTable:
         self.function_sink_params: Dict[str, List[Tuple[int, str, CodeLocation]]] = {}  # func/method -> list of (param_idx, sink_name, loc)
 
     def add_class(self, cls: ClassSymbol):
-        self.classes[cls.name] = cls
-        if cls.full_name and cls.full_name != cls.name:
-            self.classes[cls.full_name] = cls
+        canonical_name = cls.full_name or cls.name
+        self.classes[canonical_name] = cls
+        # Keep a short-name alias only while it is unambiguous. Once two
+        # namespaces define the same short name, callers must use the FQCN.
+        existing = self.classes.get(cls.name)
+        if existing is None or (existing.full_name or existing.name) == canonical_name:
+            self.classes[cls.name] = cls
+        else:
+            self.classes.pop(cls.name, None)
 
     def add_function(self, func: FunctionSymbol):
-        self.functions[func.name] = func
-        if func.full_name and func.full_name != func.name:
-            self.functions[func.full_name] = func
+        canonical_name = func.full_name or func.name
+        self.functions[canonical_name] = func
+        existing = self.functions.get(func.name)
+        if existing is None or (existing.full_name or existing.name) == canonical_name:
+            self.functions[func.name] = func
+        else:
+            self.functions.pop(func.name, None)
 
     def get_class(self, name: str) -> Optional[ClassSymbol]:
         return self.classes.get(name)
@@ -172,5 +182,5 @@ class ProjectSymbolTable:
             if not cls:
                 break
             hierarchy.append(cls)
-            curr_name = cls.parent_class
+            curr_name = cls.resolved_parent or cls.parent_class
         return hierarchy

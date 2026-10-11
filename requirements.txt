@@ -1,15 +1,2 @@
-tree-sitter>=0.24.0
-tree-sitter-php>=0.23.0
-pyyaml>=6.0
-rich>=13.0.0
-pydantic>=2.0.0
-click>=8.0.0
-jinja2>=3.1.0
-networkx>=3.0
-httpx>=0.24.0
-pytest>=7.0.0
-
-# LLM-assisted Verification (OpenAI / Gemini / Ollama)
-openai>=1.0.0
-google-generativeai>=0.8.0
+-e .[llm]
 

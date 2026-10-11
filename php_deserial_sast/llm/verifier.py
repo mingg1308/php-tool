@@ -25,7 +25,13 @@ class LLMVerifier:
         symbol_table: Optional[ProjectSymbolTable] = None
     ):
         self.provider = provider.lower()
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("GEMINI_API_KEY")
+        provider_env_keys = {
+            "openai": "OPENAI_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+        }
+        env_key = provider_env_keys.get(self.provider)
+        self.api_key = api_key or (os.getenv(env_key) if env_key else None)
+        self.last_error: Optional[str] = None
         self.ollama_url = ollama_url
         self.slicer = CodeSlicer(symbol_table)
 
@@ -33,7 +39,7 @@ class LLMVerifier:
             if self.provider == "openai":
                 self.model = "gpt-4o-mini"
             elif self.provider == "gemini":
-                self.model = "gemini-1.5-flash"
+                self.model = "gemini-3.6-flash"
             elif self.provider == "ollama":
                 self.model = "qwen2.5-coder:7b"
             else:
@@ -43,6 +49,7 @@ class LLMVerifier:
 
     def verify_finding(self, finding: Finding) -> Optional[LLMVerificationResult]:
         """Send code context of finding to LLM and parse verification response."""
+        self.last_error = None
         code_slice = self.slicer.slice_finding(finding)
         chain_details = finding.gadget_chain.payload_blueprint if finding.gadget_chain else ""
         user_prompt = build_verification_prompt(
@@ -62,9 +69,15 @@ class LLMVerifier:
             else:
                 return None
 
-            return self._parse_llm_json(raw_response)
+            parsed = self._parse_llm_json(raw_response)
+            if parsed is None:
+                self.last_error = "LLM response did not match the required JSON schema."
+            return parsed
         except Exception as e:
-            # Silently or log error without aborting scanner
+            message = str(e)
+            if self.api_key:
+                message = message.replace(self.api_key, "[REDACTED]")
+            self.last_error = f"{type(e).__name__}: {message}"
             return None
 
     def _call_openai(self, prompt: str) -> str:
@@ -97,7 +110,7 @@ class LLMVerifier:
             system_instruction=SYSTEM_PROMPT,
             generation_config={"response_mime_type": "application/json"}
         )
-        response = model.generate_content(prompt)
+        response = model.generate_content(prompt, request_options={"timeout": 30, "retry": None})
         return response.text
 
     def _call_ollama(self, prompt: str) -> str:
@@ -135,8 +148,8 @@ class LLMVerifier:
         try:
             data = json.loads(cleaned)
             return LLMVerificationResult(
-                is_vulnerable=bool(data.get("is_vulnerable", True)),
-                confidence_score=float(data.get("confidence_score", 0.8)),
+                is_vulnerable=data["is_vulnerable"],
+                confidence_score=data["confidence_score"],
                 reasoning=str(data.get("reasoning", "")),
                 exploitability_assessment=str(data.get("exploitability_assessment", "UNKNOWN")),
                 prerequisites=list(data.get("prerequisites", [])),

@@ -27,7 +27,10 @@ class CallGraph:
 
     def __init__(self, symbol_table: ProjectSymbolTable):
         self.symbol_table = symbol_table
-        self.graph = nx.DiGraph()
+        # Multiple call sites can connect the same pair of methods. A
+        # MultiDiGraph preserves every edge instead of silently keeping only
+        # the last one.
+        self.graph = nx.MultiDiGraph()
         self.edges: List[CallEdge] = []
         self._build_graph()
 
@@ -40,11 +43,12 @@ class CallGraph:
 
         # Add all methods as nodes
         for cls in unique_classes:
+            class_key = cls.full_name or cls.name
             for method_name, method_sym in cls.methods.items():
-                node_key = self._method_key(cls.name, method_name)
+                node_key = self._method_key(class_key, method_name)
                 self.graph.add_node(
                     node_key,
-                    class_name=cls.name,
+                    class_name=class_key,
                     method_name=method_name,
                     method_sym=method_sym,
                     is_magic=method_sym.is_magic
@@ -52,8 +56,9 @@ class CallGraph:
 
         # Build edges based on method calls and potential dynamic dispatches
         for cls in unique_classes:
+            class_key = cls.full_name or cls.name
             for method_name, method_sym in cls.methods.items():
-                caller_key = self._method_key(cls.name, method_name)
+                caller_key = self._method_key(class_key, method_name)
 
                 # 1. Direct and dynamic method calls
                 for call in method_sym.calls:
@@ -64,35 +69,37 @@ class CallGraph:
                         # If internal call: $this->cleanUp()
                         if target_obj == "$this":
                             if callee_name in cls.methods:
-                                callee_key = self._method_key(cls.name, callee_name)
-                                self._add_edge(cls.name, method_name, cls.name, callee_name, "DIRECT_METHOD_CALL", call, 1.0)
+                                self._add_edge(class_key, method_name, class_key, callee_name, "DIRECT_METHOD_CALL", call, 1.0)
                             elif "__call" in cls.methods:
-                                self._add_edge(cls.name, method_name, cls.name, "__call", "MAGIC_CALL", call, 0.9)
+                                self._add_edge(class_key, method_name, class_key, "__call", "MAGIC_CALL", call, 0.9)
                         else:
                             # Dynamic dispatch on property object e.g. $this->handler->close()
                             # Potential targets: any class with method callee_name or with __call
                             matching_classes = self.symbol_table.find_classes_with_method(callee_name)
                             for target_cls in matching_classes:
-                                self._add_edge(cls.name, method_name, target_cls.name, callee_name, "DYNAMIC_DISPATCH", call, 0.8)
+                                target_key = target_cls.full_name or target_cls.name
+                                self._add_edge(class_key, method_name, target_key, callee_name, "DYNAMIC_DISPATCH", call, 0.8)
 
                             # Also classes with __call
                             classes_with_magic_call = self.symbol_table.find_classes_with_method("__call")
                             for target_cls in classes_with_magic_call:
-                                if target_cls.name != cls.name:
-                                    self._add_edge(cls.name, method_name, target_cls.name, "__call", "MAGIC_CALL", call, 0.7)
+                                target_key = target_cls.full_name or target_cls.name
+                                if target_key != class_key:
+                                    self._add_edge(class_key, method_name, target_key, "__call", "MAGIC_CALL", call, 0.7)
 
                     elif call.call_type == "FUNCTION_CALL" and call.is_sink:
                         # Sink call edge
                         sink_node_key = f"SINK::{call.callee_name}"
                         if not self.graph.has_node(sink_node_key):
                             self.graph.add_node(sink_node_key, is_sink=True, sink_name=call.callee_name, category=call.sink_category)
-                        self._add_edge(cls.name, method_name, None, call.callee_name, "SINK", call, 1.0)
+                        self._add_edge(class_key, method_name, None, call.callee_name, "SINK", call, 1.0)
 
                 # 2. String conversion edges (kích hoạt __toString)
                 if method_sym.string_conversions:
                     classes_with_tostring = self.symbol_table.find_classes_with_method("__toString")
                     for target_cls in classes_with_tostring:
-                        if target_cls.name != cls.name:
+                        target_key = target_cls.full_name or target_cls.name
+                        if target_key != class_key:
                             dummy_call = CallExpressionInfo(
                                 call_type="METHOD_CALL",
                                 callee_name="__toString",
@@ -100,13 +107,14 @@ class CallGraph:
                                 arguments=[],
                                 location=method_sym.location
                             )
-                            self._add_edge(cls.name, method_name, target_cls.name, "__toString", "MAGIC_TOSTRING", dummy_call, 0.75)
+                            self._add_edge(class_key, method_name, target_key, "__toString", "MAGIC_TOSTRING", dummy_call, 0.75)
 
                 # 3. Property access edges (kích hoạt __get)
                 if method_sym.property_accesses:
                     classes_with_get = self.symbol_table.find_classes_with_method("__get")
                     for target_cls in classes_with_get:
-                        if target_cls.name != cls.name:
+                        target_key = target_cls.full_name or target_cls.name
+                        if target_key != class_key:
                             dummy_call = CallExpressionInfo(
                                 call_type="METHOD_CALL",
                                 callee_name="__get",
@@ -114,7 +122,7 @@ class CallGraph:
                                 arguments=[],
                                 location=method_sym.location
                             )
-                            self._add_edge(cls.name, method_name, target_cls.name, "__get", "MAGIC_GET", dummy_call, 0.6)
+                            self._add_edge(class_key, method_name, target_key, "__get", "MAGIC_GET", dummy_call, 0.6)
 
     def _add_edge(self, caller_cls: str, caller_m: str, callee_cls: Optional[str], callee_m: str,
                   edge_type: str, call_info: CallExpressionInfo, confidence: float):
@@ -141,8 +149,8 @@ class CallGraph:
         if not self.graph.has_node(node_key):
             return []
         successors = []
-        for succ in self.graph.successors(node_key):
-            edge_data = self.graph.get_edge_data(node_key, succ).get("edge_data")
+        for _, succ, _, data in self.graph.out_edges(node_key, keys=True, data=True):
+            edge_data = data.get("edge_data")
             if edge_data:
                 successors.append((succ, edge_data))
         return successors

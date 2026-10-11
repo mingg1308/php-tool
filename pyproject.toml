@@ -20,7 +20,6 @@ dependencies = [
     "jinja2>=3.1.0",
     "networkx>=3.0",
     "httpx>=0.24.0",
-    "pytest>=7.0.0",
 ]
 
 [project.optional-dependencies]
@@ -36,6 +35,6 @@ php-deserial-sast = "php_deserial_sast.cli:main"
 where = ["."]
 include = ["php_deserial_sast*"]
 
-[tool.pytest.ini_options]
-addopts = "-p no:cacheprovider"
+[tool.setuptools.package-data]
+php_deserial_sast = ["rules/definitions/*.yaml"]
 

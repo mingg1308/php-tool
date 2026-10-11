@@ -260,7 +260,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <header>
             <div class="header-title">
                 <h1>PHP Insecure Deserialization SAST Report</h1>
-                <p>Target: <strong>{{ target_path }}</strong> • Scanned {{ summary.total_files_scanned }} files in {{ summary.scan_duration_seconds }}s</p>
+                <p>Target: <strong>{{ target_path }}</strong> • Scanned {{ summary.total_files_scanned }} of {{ summary.total_files_discovered }} files in {{ summary.scan_duration_seconds }}s</p>
+                {% if errors %}
+                <p>Incomplete scan: {{ summary.files_with_errors }} file(s) had errors.</p>
+                <ul>
+                    {% for error in errors %}
+                    <li>{{ error.file_path|e }} ({{ error.phase|e }}): {{ error.message|e }}</li>
+                    {% endfor %}
+                </ul>
+                {% endif %}
             </div>
         </header>
 
@@ -394,13 +402,17 @@ class HTMLReporter:
     """Generates self-contained interactive HTML reports using Jinja2."""
 
     def generate_html(self, result: ScanResult) -> str:
-        from jinja2 import Template
-        template = Template(HTML_TEMPLATE)
+        from jinja2 import Environment, select_autoescape
+        environment = Environment(
+            autoescape=select_autoescape(default=True, default_for_string=True)
+        )
+        template = environment.from_string(HTML_TEMPLATE)
         return template.render(
             target_path=result.target_path,
             summary=result.summary,
             findings=result.findings,
-            gadget_chains=result.gadget_chains
+            gadget_chains=result.gadget_chains,
+            errors=result.errors
         )
 
     def save_to_file(self, result: ScanResult, output_path: str):
