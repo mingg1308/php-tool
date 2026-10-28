@@ -62,6 +62,16 @@ class ConsoleReporter:
         table.add_row("Files Discovered", str(result.summary.total_files_discovered))
         table.add_row("Files Scanned", str(result.summary.total_files_scanned))
         table.add_row("Files With Errors", str(result.summary.files_with_errors))
+        table.add_row("Library Mode", str(result.analysis.get("library_mode", "unknown")))
+        table.add_row("Target PHP", str(result.analysis.get("target_php_version", "unknown")))
+        table.add_row("Conditional API Exposures", str(result.summary.api_exposure_count))
+        sink_inventory = result.analysis.get("sink_inventory", {})
+        if sink_inventory.get("enabled"):
+            dispositions = sink_inventory.get("by_disposition", {})
+            observed = dispositions.get("observed_request", 0) + dispositions.get("observed_request_unresolved", 0)
+            table.add_row("Deserialization/Phar Sinks", str(sink_inventory.get("total_sinks", 0)))
+            table.add_row("  - Request-Reachable Sinks", str(observed))
+            table.add_row("  - Conditional Library Sinks", str(dispositions.get("conditional_library_api", 0)))
         table.add_row("Lines of Code", str(result.summary.total_lines_scanned))
         table.add_row("Classes Analyzed", str(result.summary.total_classes_found))
         table.add_row("Methods Analyzed", str(result.summary.total_methods_found))
@@ -94,6 +104,9 @@ class ConsoleReporter:
         content_lines = []
         content_lines.append(f"[bold]Location:[/bold] [underline cyan]{finding.location}[/underline cyan]")
         content_lines.append(f"[bold]Confidence:[/bold] {finding.confidence.value}")
+        if finding.assessment:
+            content_lines.append(f"[bold]Static detection:[/bold] {finding.assessment.detection_level}")
+            content_lines.append(f"[bold]Exploitability verified:[/bold] {finding.assessment.exploitability_verified}")
         content_lines.append(f"[bold]Description:[/bold] {finding.description}")
 
         if finding.cwe:
@@ -145,7 +158,10 @@ class ConsoleReporter:
         if finding.llm_verification:
             llm = finding.llm_verification
             status_style = "bold green" if llm.is_vulnerable else "bold yellow"
-            status_text = "CONFIRMED TRUE POSITIVE" if llm.is_vulnerable else "LIKELY FALSE POSITIVE"
+            status_text = (
+                "POTENTIAL VULNERABILITY - MANUAL REVIEW REQUIRED"
+                if llm.is_vulnerable else "POSSIBLE FALSE POSITIVE - MANUAL REVIEW REQUIRED"
+            )
             llm_text = (
                 f"[{status_style}]🤖 LLM Verification: {status_text}[/{status_style}] "
                 f"(Confidence: {llm.confidence_score*100:.0f}%)\n"

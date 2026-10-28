@@ -1,0 +1,109 @@
+rules:
+  - id: php-request-to-unserialize
+    languages: [php]
+    mode: taint
+    message: Request-controlled data reaches unserialize().
+    severity: ERROR
+    metadata:
+      category: observed-request-flow
+      cwe: CWE-502
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+          - pattern: $_FILES[...]
+          - pattern: file_get_contents("php://input")
+          - pattern: getallheaders()
+          - pattern: apache_request_headers()
+    pattern-sanitizers:
+      - pattern: (int) $X
+      - pattern: intval(...)
+    pattern-sinks:
+      - patterns:
+          - pattern: unserialize($DATA, ...)
+          - pattern-not: unserialize($DATA, ["allowed_classes" => false])
+          - pattern-not: unserialize($DATA, array("allowed_classes" => false))
+
+  - id: php-request-to-phar-filesystem-sink
+    languages: [php]
+    mode: taint
+    message: Request-controlled path reaches a filesystem operation associated with implicit Phar metadata deserialization on PHP before 8.0.
+    severity: WARNING
+    metadata:
+      category: observed-request-flow
+      cwe: CWE-502
+      automatic_phar_metadata_requires: PHP < 8.0
+    pattern-sources:
+      - pattern-either:
+          - pattern: $_GET[...]
+          - pattern: $_POST[...]
+          - pattern: $_REQUEST[...]
+          - pattern: $_COOKIE[...]
+          - pattern: $_FILES[...]
+          - pattern: file_get_contents("php://input")
+    pattern-sanitizers:
+      - patterns:
+          - pattern: $PATH
+          - pattern-inside: |
+              if (preg_match($RE, $PATH)) {
+                ...
+              }
+    pattern-sinks:
+      - pattern-either:
+          - pattern: file_exists($PATH)
+          - pattern: is_file($PATH)
+          - pattern: is_dir($PATH)
+          - pattern: is_readable($PATH)
+          - pattern: is_writable($PATH)
+          - pattern: filesize($PATH)
+          - pattern: file_get_contents($PATH)
+          - pattern: fopen($PATH, ...)
+          - pattern: getimagesize($PATH, ...)
+          - pattern: unlink($PATH)
+          - pattern: readfile($PATH)
+          - pattern: file($PATH, ...)
+          - pattern: copy($PATH, ...)
+          - pattern: rename($PATH, ...)
+          - pattern: exif_read_data($PATH, ...)
+          - pattern: hash_file($ALGO, $PATH, ...)
+          - pattern: hash_hmac_file($ALGO, $PATH, ...)
+
+  - id: php-unserialize-review
+    languages: [php]
+    message: Review unserialize(); object injection requires untrusted serialized data and available gadget classes.
+    severity: WARNING
+    metadata:
+      category: syntactic-review
+      cwe: CWE-502
+    patterns:
+      - pattern: unserialize($DATA, ...)
+      - pattern-not: unserialize($DATA, ["allowed_classes" => false])
+      - pattern-not: unserialize($DATA, array("allowed_classes" => false))
+
+  - id: php-phar-path-api-review
+    languages: [php]
+    message: Review whether this path can contain phar:// and whether the target runtime is PHP before 8.0.
+    severity: INFO
+    metadata:
+      category: conditional-path-api
+      automatic_phar_metadata_requires: PHP < 8.0
+    pattern-either:
+      - pattern: file_exists($PATH)
+      - pattern: is_file($PATH)
+      - pattern: is_dir($PATH)
+      - pattern: is_readable($PATH)
+      - pattern: is_writable($PATH)
+      - pattern: filesize($PATH)
+      - pattern: file_get_contents($PATH)
+      - pattern: fopen($PATH, ...)
+      - pattern: getimagesize($PATH, ...)
+      - pattern: unlink($PATH)
+      - pattern: readfile($PATH)
+      - pattern: file($PATH, ...)
+      - pattern: copy($PATH, ...)
+      - pattern: rename($PATH, ...)
+      - pattern: exif_read_data($PATH, ...)
+      - pattern: hash_file($ALGO, $PATH, ...)
+      - pattern: hash_hmac_file($ALGO, $PATH, ...)

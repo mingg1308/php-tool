@@ -5,6 +5,7 @@ Symbol Table and AST Metadata extraction for PHP codebase analysis.
 from typing import Dict, List, Optional, Set, Any, Tuple
 from dataclasses import dataclass, field
 from php_deserial_sast.models import CodeLocation
+from php_deserial_sast.core.finding_scope import is_test_source_path
 
 
 MAGIC_METHODS = {
@@ -15,8 +16,9 @@ MAGIC_METHODS = {
 }
 
 POP_ENTRY_MAGIC_METHODS = {
-    "__destruct", "__wakeup", "__toString", "__unserialize",
-    "__call", "__callStatic", "__get", "__set", "__isset", "__unset", "__invoke"
+    # PHP invokes these as part of object restoration/lifecycle. Other magic
+    # methods need a separate, proven trigger in the call graph.
+    "__destruct", "__wakeup", "__unserialize"
 }
 
 
@@ -39,6 +41,7 @@ class CallExpressionInfo:
     ast_node: Optional[Any] = None
     is_sink: bool = False
     sink_category: Optional[str] = None  # "RCE", "FILE_WRITE", "FILE_READ", etc.
+    callback_property_source: Optional[str] = None  # Syntactic source; not proof of exploitability.
 
 
 @dataclass
@@ -48,6 +51,7 @@ class MethodSymbol:
     visibility: str = "public"
     is_static: bool = False
     parameters: List[str] = field(default_factory=list)
+    parameter_types: Dict[str, str] = field(default_factory=dict)
     is_magic: bool = False
     location: Optional[CodeLocation] = None
     body_text: str = ""
@@ -67,6 +71,7 @@ class ClassSymbol:
     interfaces: List[str] = field(default_factory=list)
     resolved_interfaces: List[str] = field(default_factory=list)
     traits: List[str] = field(default_factory=list)
+    trait_adaptations: bool = False
     properties: Dict[str, PropertySymbol] = field(default_factory=dict)
     methods: Dict[str, MethodSymbol] = field(default_factory=dict)
     use_map: Dict[str, str] = field(default_factory=dict)
@@ -101,12 +106,18 @@ class ProjectSymbolTable:
         self.functions: Dict[str, FunctionSymbol] = {}
         self.files_scanned: Set[str] = set()
         self.file_use_maps: Dict[str, Dict[str, str]] = {}  # file_path -> {alias: FQCN}
-        # Inter-procedural taint metadata
-        self.function_taint_sources: Dict[str, Tuple[bool, List[Any], str]] = {}  # func/method -> (is_tainted, steps, source_name)
-        self.function_sink_params: Dict[str, List[Tuple[int, str, CodeLocation]]] = {}  # func/method -> list of (param_idx, sink_name, loc)
 
     def add_class(self, cls: ClassSymbol):
         canonical_name = cls.full_name or cls.name
+        existing_canonical = self.classes.get(canonical_name)
+        if existing_canonical is not None and existing_canonical.file_path != cls.file_path:
+            # A payload-generation test file may redeclare an application's
+            # class. Prefer the production definition for project-wide
+            # resolution; entrypoint-specific ambiguity remains a separate
+            # question for class-loading analysis.
+            if (is_test_source_path(cls.file_path)
+                    and not is_test_source_path(existing_canonical.file_path)):
+                return
         self.classes[canonical_name] = cls
         # Keep a short-name alias only while it is unambiguous. Once two
         # namespaces define the same short name, callers must use the FQCN.

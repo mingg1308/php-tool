@@ -1,0 +1,33 @@
+rules:
+  - id: php-phar-path-api-review
+    message: "Review whether this filesystem path can contain phar://; automatic Phar metadata deserialization applies only before PHP 8.0"
+    severity: INFO
+    confidence: LOW
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Treat this as an API review hint. Verify the path source and target PHP version; reject phar:// when accepting untrusted paths on PHP versions before 8.0."
+    pattern-either:
+      - pattern: "file_exists($PATH)"
+      - pattern: "is_file($PATH)"
+      - pattern: "is_dir($PATH)"
+      - pattern: "is_readable($PATH)"
+      - pattern: "is_writable($PATH)"
+      - pattern: "filesize($PATH)"
+      - pattern: "file_get_contents($PATH)"
+      - pattern: "file_get_contents($PATH, ...)"
+      - pattern: "fopen($PATH, $MODE)"
+      - pattern: "fopen($PATH, $MODE, ...)"
+      - pattern: "getimagesize($PATH)"
+      - pattern: "getimagesize($PATH, ...)"
+      - pattern: "unlink($PATH)"
+      - pattern: "readfile($PATH)"
+      - pattern: "file($PATH)"
+      - pattern: "file($PATH, ...)"
+      - pattern: "copy($PATH, $DESTINATION)"
+      - pattern: "rename($PATH, $DESTINATION)"
+      - pattern: "exif_read_data($PATH)"
+      - pattern: "exif_read_data($PATH, ...)"
+      - pattern: "hash_file($ALGO, $PATH)"
+      - pattern: "hash_file($ALGO, $PATH, ...)"
+      - pattern: "hash_hmac_file($ALGO, $PATH, $KEY)"
+      - pattern: "hash_hmac_file($ALGO, $PATH, $KEY, ...)"

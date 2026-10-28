@@ -39,6 +39,13 @@ class SarifReporter:
         for finding in result.findings:
             # Register rule
             if finding.rule_id not in rules_map:
+                tags = ["security", "php"]
+                if finding.cwe:
+                    tags.append(finding.cwe.split(":", 1)[0].lower())
+                if finding.vuln_type.value != "CUSTOM_RULE_MATCH" or any(
+                    token in finding.rule_id.lower() for token in ("deserial", "unserialize", "phar")
+                ):
+                    tags.append("insecure-deserialization")
                 rules_map[finding.rule_id] = {
                     "id": finding.rule_id,
                     "name": finding.title,
@@ -52,18 +59,18 @@ class SarifReporter:
                         "markdown": f"### Remediation\n{finding.remediation}" if finding.remediation else finding.description
                     },
                     "properties": {
-                        "tags": [
-                            "security",
-                            (finding.cwe or "cwe-502").split(":", 1)[0].lower(),
-                            "insecure-deserialization",
-                            "php",
-                        ],
+                        "tags": tags,
                         "security-severity": SEVERITY_TO_SECURITY_SCORE[finding.severity],
                     }
                 }
 
             # Build result item
             res_item: Dict[str, Any] = {
+                "properties": {
+                    "confidence": finding.confidence.value, **finding.metadata,
+                    "assessment": finding.assessment.model_dump(mode="json") if finding.assessment else None,
+                    "flow_evidence": [route.model_dump(mode="json") for route in finding.flow_evidence],
+                },
                 "ruleId": finding.rule_id,
                 "level": SEVERITY_TO_SARIF_LEVEL.get(finding.severity, "warning"),
                 "message": {"text": finding.description},
@@ -131,7 +138,15 @@ class SarifReporter:
                             "rules": list(rules_map.values())
                         }
                     },
-                    "results": sarif_results
+                    "results": sarif_results,
+                    "properties": {"analysis": result.analysis, "summary": result.summary.model_dump(mode="json")},
+                    "invocations": [{
+                        "executionSuccessful": not result.errors,
+                        "toolExecutionNotifications": [
+                            {"level": "warning", "message": {"text": f"{e.phase}: {e.file_path}: {e.message}"}}
+                            for e in result.errors
+                        ],
+                    }],
                 }
             ]
         }

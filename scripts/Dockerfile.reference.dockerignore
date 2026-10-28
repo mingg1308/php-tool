@@ -1,0 +1,11 @@
+**
+!progpilot/
+!progpilot/**
+!psalm/
+!psalm/**
+progpilot/.git
+psalm/.git
+progpilot/projects/tests
+psalm/tests
+progpilot/docs
+psalm/docs

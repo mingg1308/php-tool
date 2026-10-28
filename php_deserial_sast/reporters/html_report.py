@@ -261,6 +261,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="header-title">
                 <h1>PHP Insecure Deserialization SAST Report</h1>
                 <p>Target: <strong>{{ target_path }}</strong> • Scanned {{ summary.total_files_scanned }} of {{ summary.total_files_discovered }} files in {{ summary.scan_duration_seconds }}s</p>
+                <p>Library mode: {{ analysis.get('library_mode', 'unknown') }} · Target PHP: {{ analysis.get('target_php_version', 'unknown') }} · Conditional API exposures: {{ summary.api_exposure_count }}</p>
                 {% if errors %}
                 <p>Incomplete scan: {{ summary.files_with_errors }} file(s) had errors.</p>
                 <ul>
@@ -313,12 +314,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <div class="finding-meta">
                             <span><strong>Location:</strong> {{ f.location.file_path }}:{{ f.location.start_line }}</span>
                             <span><strong>Rule:</strong> {{ f.rule_id }}</span>
+                            {% if f.cwe %}
                             <span><strong>CWE:</strong> {{ f.cwe }}</span>
+                            {% endif %}
                         </div>
                     </div>
                     <span class="badge badge-{{ f.severity.value }}">{{ f.severity.value }}</span>
                 </div>
                 <p>{{ f.description }}</p>
+                {% if f.assessment %}
+                <p><strong>Static detection:</strong> {{ f.assessment.detection_level }};
+                   <strong>Exploitability verified:</strong> {{ f.assessment.exploitability_verified }}</p>
+                {% endif %}
 
                 {% if f.code_snippet %}
                 <div class="code-block">{{ f.code_snippet }}</div>
@@ -410,6 +417,7 @@ class HTMLReporter:
         return template.render(
             target_path=result.target_path,
             summary=result.summary,
+            analysis=result.analysis,
             findings=result.findings,
             gadget_chains=result.gadget_chains,
             errors=result.errors

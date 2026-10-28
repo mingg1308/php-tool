@@ -3,6 +3,7 @@ AST Visitor for extracting classes, methods, properties, and call expressions fr
 """
 
 from typing import List, Optional, Tuple, Dict, Any
+import re
 from tree_sitter import Node
 from php_deserial_sast.core.parser import (
     get_node_text,
@@ -10,6 +11,8 @@ from php_deserial_sast.core.parser import (
     find_nodes_by_type,
     find_child_by_type,
     find_child_by_field,
+    ASTIndex,
+    iter_child_nodes,
 )
 from php_deserial_sast.core.symbol_table import (
     ClassSymbol,
@@ -29,8 +32,13 @@ RCE_SINKS = {
 
 DYNAMIC_INVOKE_SINKS = {
     "call_user_func", "call_user_func_array", "forward_static_call",
-    "forward_static_call_array", "array_map", "array_filter",
-    "array_walk", "usort", "uasort", "uksort"
+    "forward_static_call_array"
+}
+
+CALLBACK_FUNCTIONS = {
+    "array_map": 0, "array_filter": 1, "array_walk": 1, "array_walk_recursive": 1,
+    "usort": 1, "uasort": 1, "uksort": 1, "call_user_func": 0,
+    "call_user_func_array": 0, "forward_static_call": 0, "forward_static_call_array": 0,
 }
 
 FILE_WRITE_SINKS = {
@@ -55,7 +63,8 @@ PHAR_TRIGGER_SINKS = {
     "is_executable", "filectime", "filemtime", "fileatime", "filesize",
     "stat", "lstat", "exif_read_data", "exif_thumbnail", "exif_imagetype",
     "md5_file", "sha1_file", "hash_file", "hash_hmac_file", "getimagesize",
-    "get_meta_tags", "simplexml_load_file", "copy", "rename"
+    "get_meta_tags", "simplexml_load_file", "copy", "rename",
+    "file_get_contents", "fopen"
 }
 
 ALL_DANGEROUS_SINKS = (
@@ -66,6 +75,7 @@ ALL_DANGEROUS_SINKS = (
 
 def categorize_sink(func_name: str) -> Optional[str]:
     """Return category of dangerous sink."""
+    func_name = func_name.lower()
     if func_name in RCE_SINKS:
         return "RCE"
     if func_name in DYNAMIC_INVOKE_SINKS:
@@ -93,9 +103,10 @@ class ASTVisitor:
         self.current_namespace = ""
         self.current_use_map: Dict[str, str] = {}
 
-    def extract_all(self, root_node: Node):
+    def extract_all(self, root_node: Node, node_index=None):
         """Extract all symbols from root node of a PHP file."""
         self.symbol_table.files_scanned.add(self.file_path)
+        self.node_index = node_index if node_index is not None else ASTIndex(root_node)
         self._extract_namespace(root_node)
         self._extract_use_declarations(root_node)
         self.symbol_table.file_use_maps[self.file_path] = dict(self.current_use_map)
@@ -104,7 +115,7 @@ class ASTVisitor:
 
     def _extract_namespace(self, root_node: Node):
         """Find namespace definition in the file."""
-        for ns_node in find_nodes_by_type(root_node, "namespace_definition"):
+        for ns_node in self.node_index.find("namespace_definition"):
             name_node = find_child_by_field(ns_node, "name") or find_child_by_type(ns_node, "namespace_name")
             if name_node:
                 self.current_namespace = get_node_text(name_node, self.source_bytes).strip("\\ ")
@@ -112,7 +123,7 @@ class ASTVisitor:
 
     def _extract_use_declarations(self, root_node: Node):
         """Extract use imports (aliases) from namespace_use_declaration nodes."""
-        for use_node in find_nodes_by_type(root_node, "namespace_use_declaration"):
+        for use_node in self.node_index.find("namespace_use_declaration"):
             for clause in find_nodes_by_type(use_node, "namespace_use_clause"):
                 target_node = None
                 alias = None
@@ -134,7 +145,7 @@ class ASTVisitor:
 
     def _extract_classes(self, root_node: Node):
         """Extract all class declarations in the file."""
-        for cls_node in find_nodes_by_type(root_node, ["class_declaration", "trait_declaration"]):
+        for cls_node in self.node_index.find(["class_declaration", "trait_declaration"]):
             name_node = find_child_by_field(cls_node, "name")
             if not name_node:
                 continue
@@ -173,9 +184,21 @@ class ASTVisitor:
                 interfaces=interfaces,
                 resolved_interfaces=resolved_interfaces,
                 use_map=dict(self.current_use_map),
+                is_abstract=any(child.type == "abstract_modifier" for child in cls_node.children),
                 file_path=self.file_path,
                 location=get_node_location(cls_node, self.file_path)
             )
+
+            body_node = find_child_by_type(cls_node, "declaration_list")
+            for trait_use in (n for n in (body_node.named_children if body_node else ()) if n.type == "use_declaration"):
+                cls_symbol.trait_adaptations |= any(c.type not in {"name", "qualified_name", "namespace_name"}
+                                                   for c in trait_use.named_children)
+                for name_node in trait_use.named_children:
+                    if name_node.type in ("name", "qualified_name", "namespace_name"):
+                        raw_trait = get_node_text(name_node, self.source_bytes).strip("\\ ")
+                        cls_symbol.traits.append(
+                            self.symbol_table.resolve_class_name(raw_trait, self.current_namespace, self.file_path)
+                        )
 
             # Body declaration list
             body_node = find_child_by_type(cls_node, "declaration_list")
@@ -187,7 +210,7 @@ class ASTVisitor:
 
     def _extract_properties(self, body_node: Node, cls_symbol: ClassSymbol):
         """Extract class properties."""
-        for prop_decl in find_nodes_by_type(body_node, "property_declaration"):
+        for prop_decl in (n for n in body_node.named_children if n.type == "property_declaration"):
             visibility = "public"
             for child in prop_decl.children:
                 if child.type == "visibility_modifier":
@@ -202,9 +225,13 @@ class ASTVisitor:
                     if val_node:
                         default_val = get_node_text(val_node, self.source_bytes)
 
+                    type_node = find_child_by_field(prop_decl, "type")
+                    type_hint = get_node_text(type_node, self.source_bytes).lstrip("?\\") if type_node else None
+
                     prop_sym = PropertySymbol(
                         name=prop_name,
                         visibility=visibility,
+                        type_hint=type_hint,
                         default_value=default_val,
                         location=get_node_location(prop_elem, self.file_path)
                     )
@@ -212,7 +239,7 @@ class ASTVisitor:
 
     def _extract_methods(self, body_node: Node, cls_symbol: ClassSymbol):
         """Extract methods and analyze their internal calls, sinks, and property usages."""
-        for method_node in find_nodes_by_type(body_node, "method_declaration"):
+        for method_node in (n for n in body_node.named_children if n.type == "method_declaration"):
             name_node = find_child_by_field(method_node, "name")
             if not name_node:
                 continue
@@ -228,12 +255,33 @@ class ASTVisitor:
 
             # Extract parameters
             params = []
+            parameter_types = {}
             params_node = find_child_by_field(method_node, "parameters") or find_child_by_type(method_node, "formal_parameters")
             if params_node:
                 for param in find_nodes_by_type(params_node, "simple_parameter"):
                     p_name = find_child_by_field(param, "name") or find_child_by_type(param, "variable_name")
                     if p_name:
-                        params.append(get_node_text(p_name, self.source_bytes))
+                        parameter_name = get_node_text(p_name, self.source_bytes)
+                        params.append(parameter_name)
+                        type_node = find_child_by_field(param, "type")
+                        type_hint = get_node_text(type_node, self.source_bytes).lstrip("?\\") if type_node else None
+                        if type_hint:
+                            parameter_types[parameter_name] = type_hint
+
+                        # Constructor property promotion carries the receiver
+                        # type needed to resolve later `$this->property->call()`.
+                        promoted_visibility = next(
+                            (get_node_text(child, self.source_bytes) for child in param.children
+                             if child.type == "visibility_modifier"),
+                            None,
+                        )
+                        if method_name == "__construct" and promoted_visibility and type_hint:
+                            cls_symbol.properties[parameter_name.lstrip("$")] = PropertySymbol(
+                                name=parameter_name.lstrip("$"),
+                                visibility=promoted_visibility,
+                                type_hint=type_hint,
+                                location=get_node_location(param, self.file_path),
+                            )
 
             # Method body
             body = find_child_by_field(method_node, "body") or find_child_by_type(method_node, "compound_statement")
@@ -245,6 +293,7 @@ class ASTVisitor:
                 visibility=visibility,
                 is_static=is_static,
                 parameters=params,
+                parameter_types=parameter_types,
                 is_magic=(method_name in MAGIC_METHODS),
                 location=get_node_location(method_node, self.file_path),
                 body_text=body_text,
@@ -258,13 +307,36 @@ class ASTVisitor:
 
     def _analyze_method_body(self, body_node: Node, method_sym: MethodSymbol):
         """Analyze calls, member calls, property accesses, and string conversions inside method body."""
+        # Index the method once. Rewalking every node for six different queries
+        # was visible in stack samples on Drupal's large methods.
+        wanted = {"function_call_expression", "member_call_expression", "nullsafe_member_call_expression",
+                  "dynamic_variable_name", "member_access_expression", "cast_expression", "binary_expression"}
+        by_type = {kind: [] for kind in wanted}
+        pending = [iter((body_node,))]
+        while pending:
+            node = next(pending[-1], None)
+            if node is None:
+                pending.pop()
+                continue
+            if node.type in ("function_definition", "method_declaration", "anonymous_function", "anonymous_function_creation_expression", "arrow_function", "class_declaration", "anonymous_class"):
+                continue
+            if node.type in wanted:
+                by_type[node.type].append(node)
+            if node.type not in {"integer", "float", "boolean", "null", "string",
+                                 "name", "qualified_name", "string_content", "escape_sequence", "comment"}:
+                pending.append(iter_child_nodes(node, named=True))
+
+        def local_nodes(types):
+            types = (types,) if isinstance(types, str) else types
+            return sorted((node for kind in types for node in by_type[kind]), key=lambda n: n.start_byte)
         # 1. Function calls (e.g. eval($this->x), file_put_contents($this->f, $this->d))
-        for call_node in find_nodes_by_type(body_node, "function_call_expression"):
+        for call_node in local_nodes("function_call_expression"):
             fn_node = find_child_by_field(call_node, "function")
             if fn_node:
                 fn_name = get_node_text(fn_node, self.source_bytes).strip("\\ ")
                 args = self._extract_arguments(call_node)
-                category = categorize_sink(fn_name)
+                args_node = find_child_by_field(call_node, "arguments") or find_child_by_type(call_node, "arguments")
+                category = self._categorize_call_sink(fn_name, args_node)
                 is_sink = category is not None
 
                 call_info = CallExpressionInfo(
@@ -274,19 +346,24 @@ class ASTVisitor:
                     location=get_node_location(call_node, self.file_path),
                     ast_node=call_node,
                     is_sink=is_sink,
-                    sink_category=category
+                    sink_category=category,
+                    callback_property_source=(
+                        self._callback_property_source(call_node, args_node)
+                        if category == "DYNAMIC_INVOCATION" else None
+                    ),
                 )
                 method_sym.calls.append(call_info)
 
         # 2. Member method calls (e.g. $this->handler->close(), $this->cleanUp())
-        for mcall_node in find_nodes_by_type(body_node, ["member_call_expression", "nullsafe_member_call_expression"]):
+        for mcall_node in local_nodes(["member_call_expression", "nullsafe_member_call_expression"]):
             obj_node = find_child_by_field(mcall_node, "object")
             name_node = find_child_by_field(mcall_node, "name")
             if name_node:
                 callee_name = get_node_text(name_node, self.source_bytes).strip()
                 target_obj = get_node_text(obj_node, self.source_bytes).strip() if obj_node else None
                 args = self._extract_arguments(mcall_node)
-                category = categorize_sink(callee_name)
+                # User-defined methods named e.g. unlink are not PHP builtins.
+                category = None
 
                 call_info = CallExpressionInfo(
                     call_type="METHOD_CALL",
@@ -301,12 +378,12 @@ class ASTVisitor:
                 method_sym.calls.append(call_info)
 
         # 3. Dynamic method calls / property accesses (e.g. ($this->func)($arg), $this->$callback($data))
-        for dcall_node in find_nodes_by_type(body_node, "dynamic_variable_name"):
+        for dcall_node in local_nodes("dynamic_variable_name"):
             var_text = get_node_text(dcall_node, self.source_bytes)
             method_sym.property_accesses.add(var_text)
 
         # 4. Property accesses ($this->property_name)
-        for mem_access in find_nodes_by_type(body_node, "member_access_expression"):
+        for mem_access in local_nodes("member_access_expression"):
             obj_node = find_child_by_field(mem_access, "object")
             prop_node = find_child_by_field(mem_access, "name")
             if obj_node and prop_node:
@@ -316,7 +393,7 @@ class ASTVisitor:
                     method_sym.property_accesses.add(prop_text)
 
         # 5. String conversions (e.g. (string)$this->handler or string concatenation with property)
-        for cast_node in find_nodes_by_type(body_node, "cast_expression"):
+        for cast_node in local_nodes("cast_expression"):
             type_node = find_child_by_type(cast_node, "cast_type")
             if type_node and "string" in get_node_text(type_node, self.source_bytes).lower():
                 val_node = find_child_by_field(cast_node, "value")
@@ -325,7 +402,7 @@ class ASTVisitor:
                     method_sym.string_conversions.append(val_text)
 
         # Binary string concatenation ($x . $this->prop or "$this->prop")
-        for bin_expr in find_nodes_by_type(body_node, "binary_expression"):
+        for bin_expr in local_nodes("binary_expression"):
             op_node = find_child_by_field(bin_expr, "operator") or find_child_by_type(bin_expr, ".")
             if op_node and get_node_text(op_node, self.source_bytes) == ".":
                 left = find_child_by_field(bin_expr, "left")
@@ -333,6 +410,65 @@ class ASTVisitor:
                 for side in (left, right):
                     if side and "$this->" in get_node_text(side, self.source_bytes):
                         method_sym.string_conversions.append(get_node_text(side, self.source_bytes))
+
+    def _categorize_call_sink(self, fn_name: str, args_node: Optional[Node]) -> Optional[str]:
+        """Classify higher-order calls by the callback they actually invoke."""
+        fn_name = fn_name.lower()
+        if fn_name not in CALLBACK_FUNCTIONS:
+            return categorize_sink(fn_name)
+
+        arguments = [child for child in (args_node.children if args_node else [])
+                     if child.type == "argument"]
+        index = CALLBACK_FUNCTIONS[fn_name]
+        if index >= len(arguments):
+            return None
+        callback = arguments[index].named_children[-1] if arguments[index].named_children else arguments[index]
+        callback_text = get_node_text(callback, self.source_bytes).strip()
+        # A closure or arrow function is fixed at this call site. Its body may
+        # contain sinks of its own, but the serialized object cannot replace
+        # the callback merely by controlling the array being processed.
+        if callback.type in {"anonymous_function", "anonymous_function_creation_expression", "arrow_function"}:
+            return None
+        if callback.type in ("encapsed_string", "string") and all(c.type in ("string_content", "escape_sequence") for c in callback.named_children):
+            callback_name = callback_text.strip("'\"").strip("\\ ")
+            return categorize_sink(callback_name)
+        return "DYNAMIC_INVOCATION"
+
+    def _callback_property_source(self, call_node: Node, args_node: Optional[Node]) -> Optional[str]:
+        """Recognize a direct property callback or a local foreach binding.
+
+        This records a candidate serialized-property dependency. It does not
+        establish that an attacker can deserialize the class or satisfy all
+        intervening branch conditions.
+        """
+        name_node = find_child_by_field(call_node, "function")
+        name = get_node_text(name_node, self.source_bytes).strip("\\ ").lower() if name_node else ""
+        index = CALLBACK_FUNCTIONS.get(name)
+        args = [child for child in (args_node.children if args_node else []) if child.type == "argument"]
+        if index is None or index >= len(args):
+            return None
+        callback = args[index].named_children[-1] if args[index].named_children else args[index]
+        callback_text = get_node_text(callback, self.source_bytes).strip()
+        direct = re.fullmatch(r"\$this->([A-Za-z_][A-Za-z_0-9]*)", callback_text)
+        if direct:
+            return direct[1]
+        if callback.type != "variable_name":
+            return None
+        parent = call_node.parent
+        while parent and parent.type not in {"method_declaration", "function_definition"}:
+            if parent.type == "foreach_statement":
+                parts = parent.named_children
+                if (len(parts) >= 3 and parts[1].type == "variable_name"
+                        and get_node_text(parts[1], self.source_bytes) == callback_text
+                        and parts[0].type == "member_access_expression"):
+                    source = get_node_text(parts[0], self.source_bytes)
+                    bound = re.fullmatch(r"\$this->([A-Za-z_][A-Za-z_0-9]*)", source)
+                    if bound:
+                        between = self.source_bytes[parts[1].end_byte:call_node.start_byte].decode("utf-8", errors="replace")
+                        if not re.search(re.escape(callback_text) + r"\s*(?:=(?!=)|\+=|-=|\*=|\.=|\+\+|--)", between):
+                            return bound[1]
+            parent = parent.parent
+        return None
 
     def _extract_arguments(self, call_node: Node) -> List[str]:
         """Extract text of argument expressions."""
@@ -346,7 +482,7 @@ class ASTVisitor:
 
     def _extract_functions(self, root_node: Node):
         """Extract standalone function definitions."""
-        for fn_node in find_nodes_by_type(root_node, "function_definition"):
+        for fn_node in self.node_index.find("function_definition"):
             name_node = find_child_by_field(fn_node, "name")
             if not name_node:
                 continue

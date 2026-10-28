@@ -1,10 +1,10 @@
 rules:
   - id: php-magic-destruct-dangerous-sink
-    message: "Magic method __destruct() executes dangerous function or dynamic call"
-    severity: CRITICAL
-    confidence: HIGH
-    cwe: "CWE-502: Deserialization of Untrusted Data"
-    owasp: "A08:2021-Software and Data Integrity Failures"
+    message: "Review a dangerous operation in __destruct(); this pattern alone does not establish a deserialization path, attacker-controlled arguments, or exploitability"
+    severity: HIGH
+    confidence: MEDIUM
+    cwe: null
+    owasp: null
     remediation: "Avoid performing dynamic evaluation, command execution, or dynamic property calls in __destruct()."
     pattern-inside: "function __destruct(...) { ... }"
     pattern-either:
@@ -15,14 +15,13 @@ rules:
       - pattern: "call_user_func(...)"
       - pattern: "call_user_func_array(...)"
       - pattern: "file_put_contents(...)"
-      - pattern: "unlink(...)"
 
   - id: php-magic-wakeup-dangerous-sink
-    message: "Magic method __wakeup() executes dangerous function or dynamic call"
-    severity: CRITICAL
-    confidence: HIGH
-    cwe: "CWE-502: Deserialization of Untrusted Data"
-    owasp: "A08:2021-Software and Data Integrity Failures"
+    message: "Review a dangerous operation in __wakeup(); this pattern alone does not establish attacker-controlled arguments or exploitability"
+    severity: HIGH
+    confidence: MEDIUM
+    cwe: null
+    owasp: null
     remediation: "Do not execute unvalidated logic or side-effects inside __wakeup()."
     pattern-inside: "function __wakeup(...) { ... }"
     pattern-either:
@@ -31,3 +30,35 @@ rules:
       - pattern: "exec(...)"
       - pattern: "call_user_func(...)"
       - pattern: "file_put_contents(...)"
+
+  - id: php-magic-destruct-filesystem-delete-review
+    message: "Review whether __destruct() can delete an attacker-selected file; this syntax match does not establish a deserialization gadget"
+    severity: INFO
+    confidence: LOW
+    cwe: null
+    owasp: null
+    remediation: "Trace the file path to its source and confirm whether this destructor is reachable through untrusted deserialization."
+    pattern-inside: "function __destruct(...) { ... }"
+    pattern-either:
+      - pattern: "unlink(...)"
+      - pattern: "rmdir(...)"
+
+  - id: php-magic-unserialize-dangerous-sink
+    message: "Review a dangerous operation inside __unserialize(); this syntax match does not establish untrusted input, class loading, or exploitability"
+    severity: MEDIUM
+    confidence: LOW
+    cwe: null
+    owasp: null
+    remediation: "Avoid side effects based on restored object data in __unserialize(); validate the restoration input and trace any reachable deserialization entry point."
+    pattern-inside: "function __unserialize(...) { ... }"
+    pattern-either:
+      - pattern: "eval(...)"
+      - pattern: "system(...)"
+      - pattern: "exec(...)"
+      - pattern: "passthru(...)"
+      - pattern: "call_user_func(...)"
+      - pattern: "call_user_func_array(...)"
+      - pattern: "file_put_contents(...)"
+    metadata:
+      analysis_kind: magic_method_side_effect_review
+      documentation: "https://www.php.net/manual/en/language.oop5.magic.php"

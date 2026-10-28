@@ -33,6 +33,9 @@ jobs:
         run: |
           python -m php_deserial_sast.cli verify-rules
 
+      - name: Run dataflow regression tests
+        run: python -m unittest discover -s php_deserial_sast/tests -v
+
       - name: Compile Python sources
         run: |
           python -m compileall -q php_deserial_sast

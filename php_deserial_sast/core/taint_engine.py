@@ -1,609 +1,329 @@
-"""
-Dataflow and Taint Analysis Engine for PHP Insecure Deserialization and Phar vulnerabilities.
-"""
+"""Report deserialization dependencies from the project dataflow analysis."""
 
-import re
-from typing import List, Dict, Set, Tuple, Optional, Any, TYPE_CHECKING
-from tree_sitter import Node
-from php_deserial_sast.core.parser import (
-    get_node_text,
-    get_node_location,
-    find_nodes_by_type,
-    find_child_by_field,
-    find_child_by_type,
-    get_code_snippet
+import hashlib
+from php_deserial_sast.core.dataflow import FlowProject, PATH_ARGUMENTS, DESERIALIZATION_FUNCTIONS, arguments, expression, FieldKind
+from php_deserial_sast.core.parser import get_node_location
+from php_deserial_sast.models import Finding, VulnerabilityType, Severity, Confidence, SinkInventoryEntry, FlowEvidence
+
+PHAR_RUNTIME_NOTE = (
+    "Automatic Phar metadata deserialization on filesystem access applies before PHP 8.0. "
+    "PHP 8.0+ no longer does this on archive opening; explicit getMetadata() calls require separate analysis."
 )
-from php_deserial_sast.core.ast_visitor import PHAR_TRIGGER_SINKS
-from php_deserial_sast.models import (
-    Finding,
-    VulnerabilityType,
-    Severity,
-    Confidence,
-    TaintStep,
-)
-if TYPE_CHECKING:
-    from php_deserial_sast.core.symbol_table import ProjectSymbolTable
+
+FLOW_EVIDENCE_LIMIT = 32
 
 
-SOURCES_SUPERGLOBALS = {
-    "$_GET", "$_POST", "$_COOKIE", "$_REQUEST", "$_SERVER",
-    "$_FILES", "$HTTP_RAW_POST_DATA"
-}
+def representative_routes(routes):
+    """Bound presentation only; detection still considers all input routes."""
+    selected, remaining, groups = [], [], set()
+    for route in routes:
+        group = (route.flow.kind, route.flow.uncertain, route.review_conditions, route.path_assumptions)
+        if group not in groups:
+            groups.add(group)
+            selected.append(route)
+        else:
+            remaining.append(route)
+    return (selected + remaining)[:FLOW_EVIDENCE_LIMIT]
 
-SOURCES_FUNCTIONS = {
-    "file_get_contents('php://input')",
-    "php://input",
-    "getallheaders",
-    "apache_request_headers",
-}
 
-TRANSFORMATION_FUNCTIONS = {
-    "base64_decode", "urldecode", "rawurldecode", "gzuncompress",
-    "gzinflate", "gzdecode", "stripslashes", "trim", "rtrim", "ltrim",
-    "substr", "str_replace", "sprintf", "vsprintf"
-}
+def route_records(routes):
+    """Identify caller/source/guard combinations without relying on trace order."""
+    records = {}
+    for route in routes:
+        binding = next((step for step in reversed(route.flow.steps)
+                        if step.description.startswith("Argument bound to ")), None)
+        location = binding.location if binding else route.flow.steps[0].location if route.flow.steps else route.location
+        identity = (route.flow.kind, route.flow.origin, route.flow.index,
+                    route.flow.fields, route.flow.uncertain, route.review_conditions,
+                    route.path_assumptions, location.file_path,
+                    location.start_line, location.start_col)
+        route_id = hashlib.sha256(repr(identity).encode()).hexdigest()[:16]
+        records[route_id] = {
+            "id": route_id, "source_kind": route.flow.kind,
+            "source_origin": route.flow.origin,
+            "source_parameter": route.flow.index,
+            "source_fields": ["<array-key>" if field is FieldKind.ARRAY_KEY else field
+                              for field in route.flow.fields],
+            "uncertain": route.flow.uncertain,
+            "review_conditions": list(route.review_conditions),
+            "path_assumptions": list(route.path_assumptions),
+            "caller_file": location.file_path,
+            "caller_line": location.start_line,
+            "caller_column": location.start_col,
+        }
+    return records
 
-SAFE_CASTS = {"(int)", "(integer)", "(float)", "(double)", "(bool)", "(boolean)"}
-SAFE_FUNCTIONS = {"intval", "floatval", "boolval", "is_numeric", "ctype_digit"}
+
+def route_summary(records, limit=32):
+    """Summarize all distinct route records, including undisplayed traces."""
+    callers = {}
+    totals = {"with_guard": 0, "without_guard": 0, "uncertain": 0,
+              "request": 0, "framework_request": 0, "library_parameter": 0,
+              "persistent_data": 0}
+    for route in records.values():
+        guarded = bool(route["review_conditions"])
+        totals["with_guard" if guarded else "without_guard"] += 1
+        totals["uncertain"] += bool(route["uncertain"])
+        if route["source_kind"] in totals:
+            totals[route["source_kind"]] += 1
+        key = (route["caller_file"], route["caller_line"], route["caller_column"])
+        row = callers.setdefault(key, {"file": key[0], "line": key[1], "column": key[2],
+                                       "routes": 0, "with_guard": 0, "without_guard": 0,
+                                       "uncertain": 0})
+        row["routes"] += 1
+        row["with_guard" if guarded else "without_guard"] += 1
+        row["uncertain"] += bool(route["uncertain"])
+    ranked = sorted(callers.values(), key=lambda row: (-row["routes"], row["file"], row["line"], row["column"]))
+    return totals, ranked[:limit], len(ranked) > limit
 
 
 class TaintEngine:
-    """Performs intra-procedural and inter-procedural taint analysis for deserialization sinks."""
-
-    def __init__(self, file_path: str, source_bytes: bytes, root_node: Node, symbol_table: Optional[Any] = None):
+    def __init__(self, file_path, source_bytes, root_node, symbol_table=None,
+                 library_mode=False, project=None, php_version=None):
         self.file_path = file_path
-        self.source_bytes = source_bytes
-        self.root_node = root_node
-        self.symbol_table = symbol_table
-        # Variable name -> List of TaintSteps
-        self.tainted_vars: Dict[str, List[TaintStep]] = {}
-        self.known_clean_vars: Set[str] = set()
-        # Variables holding phar prefix
-        self.phar_prefix_vars: Set[str] = set()
+        self.project = project or FlowProject(
+            {file_path: (root_node, source_bytes)}, symbol_table, library_mode
+        )
+        self.owns_project = project is None
+        self.php_version = php_version
+        self.checked_sites = set()
+        self.sink_inventory = []
+        self.object_excluded_routes = {}
 
     def collect_function_summaries(self):
-        """Extract function return taint sources and parameter sink paths for inter-procedural analysis."""
-        if not self.symbol_table:
-            return
+        self.project.build()
 
-        self._trace_variable_assignments(self.root_node)
-
-        for func_node in find_nodes_by_type(self.root_node, ["function_definition", "method_declaration"]):
-            name_node = find_child_by_field(func_node, "name")
-            if not name_node:
+    def analyze(self):
+        if self.owns_project and not self.project.returns:
+            self.project.build()
+        engine = self.project.files[self.file_path]
+        candidates = []
+        implicit_phar = self.php_version is None or tuple(map(int, self.php_version.split('.')[:2])) < (8, 0)
+        for scope, nodes in engine.nodes.items():
+            candidates.extend(engine.direct_sinks(scope, False))
+            candidates.extend(engine.forwarded_sinks(scope, False))
+            for node in nodes:
+                if node.type == "function_call_expression" and engine.call_name(node) in set(PATH_ARGUMENTS) | DESERIALIZATION_FUNCTIONS:
+                    self.checked_sites.add((self.file_path, node.start_point[0] + 1, node.start_point[1] + 1))
+        self.sink_inventory = self._build_sink_inventory(engine, candidates, implicit_phar)
+        groups = {}
+        for sink in candidates:
+            if sink.name not in DESERIALIZATION_FUNCTIONS and not sink.phar_possible:
                 continue
-            func_name = get_node_text(name_node, self.source_bytes).strip()
-
-            # Parameters
-            params = []
-            params_node = find_child_by_field(func_node, "parameters") or find_child_by_type(func_node, "formal_parameters")
-            if params_node:
-                for p in params_node.children:
-                    p_text = get_node_text(p, self.source_bytes).strip()
-                    if p_text.startswith("$"):
-                        params.append(p_text.split("=")[0].strip())
-
-            body = find_child_by_field(func_node, "body") or find_child_by_type(func_node, "compound_statement")
-            if not body:
+            if sink.name not in DESERIALIZATION_FUNCTIONS and not implicit_phar:
                 continue
+            key = (sink.location.file_path, sink.location.start_line, sink.location.start_col, sink.argument, sink.name)
+            groups.setdefault(key, []).append(sink)
+        findings = []
+        for key, routes in groups.items():
+            excluded = [sink for sink in routes if sink.object_payload_excluded]
+            if excluded:
+                self.object_excluded_routes[key] = route_records(excluded)
+            excluded_count = len(excluded)
+            routes = [sink for sink in routes if not sink.object_payload_excluded]
+            if not routes:
+                continue
+            routes.sort(key=lambda s: ({"request": 0, "framework_request": 1,
+                                       "persistent_data": 2, "library_parameter": 3}.get(s.flow.kind, 4),
+                                       bool(s.path_assumptions), bool(s.review_conditions), s.flow.uncertain, len(s.flow.steps)))
+            records = route_records(routes)
+            route_totals, route_callers, callers_truncated = route_summary(records)
+            sink, flow = routes[0], routes[0].flow
+            assumed = flow.kind == "library_parameter"
+            modeled = flow.kind == "framework_request"
+            persistent = flow.kind == "persistent_data"
+            phar = sink.name not in DESERIALIZATION_FUNCTIONS
+            guarded = bool(sink.review_conditions)
+            if assumed:
+                kind = VulnerabilityType.LIBRARY_API_EXPOSURE
+                severity, confidence = Severity.MEDIUM, Confidence.LOW
+                title = f"Conditional API exposure to {sink.name}()"
+                description = (
+                    "A public API parameter can reach this sink under the library-mode assumption. "
+                    "No request-controlled caller is established by this finding. "
+                    "Known constant callers do not make the public API itself private or unreachable. "
+                )
+            elif persistent:
+                kind = VulnerabilityType.PHAR_DESERIALIZATION if phar else VulnerabilityType.DIRECT_UNSERIALIZE
+                severity, confidence = Severity.MEDIUM, Confidence.LOW
+                title = f"Conditional persisted-data flow to {sink.name}()"
+                description = ("Data read from a persistent store reaches this sink. "
+                               "An attacker-controlled write to the same record and runtime trigger are not established. ")
+            else:
+                kind = VulnerabilityType.PHAR_DESERIALIZATION if phar else VulnerabilityType.DIRECT_UNSERIALIZE
+                severity = Severity.HIGH if phar or modeled or flow.uncertain else Severity.CRITICAL
+                confidence = Confidence.LOW if flow.uncertain else Confidence.MEDIUM if modeled else Confidence.HIGH
+                title = f"Potential {'Phar metadata ' if phar else ''}deserialization via {sink.name}()"
+                description = ("Data from a modeled framework request API reaches the sink; verify how that request is created. "
+                               if modeled else "Request-derived data reaches the sink. ")
+                if flow.uncertain:
+                    description += "Part of the return-value propagation is unresolved and needs review. "
+            if guarded:
+                description += "Relevant branch or early-return predicates require manual validation; this trace does not establish that object payloads pass these checks. "
+            if sink.path_assumptions:
+                severity, confidence = Severity.MEDIUM, Confidence.LOW
+                description += "Project constant definitions give a local path prefix; a Phar route would require a different runtime constant configuration. Verify bootstrap order and external overrides. "
+            if phar:
+                description += PHAR_RUNTIME_NOTE
+            else:
+                description += "Object injection additionally requires object reconstruction and available gadget classes."
+            digest = hashlib.sha256(repr(key).encode()).hexdigest()[:12]
+            trace = []
+            for step in flow.steps:
+                if not trace or step != trace[-1]:
+                    trace.append(step)
+            findings.append(Finding(
+                id=f"FLOW-{digest}",
+                rule_id="php-library-api-exposure" if assumed else "php-phar-insecure-deserialization" if phar else "php-igbinary-unserialize-tainted-input" if sink.name == "igbinary_unserialize" else "php-unserialize-tainted-input",
+                vuln_type=kind, title=title, description=description,
+                severity=severity, confidence=confidence,
+                location=sink.location, code_snippet=sink.code, dataflow_trace=trace,
+                flow_evidence=[FlowEvidence(
+                    source_kind=route.flow.kind, source_origin=route.flow.origin,
+                    source_parameter=route.flow.index,
+                    source_fields=['<array-key>' if f is FieldKind.ARRAY_KEY else f for f in route.flow.fields],
+                    uncertain=route.flow.uncertain,
+                    guard_status="unrecognized_guard" if route.review_conditions else "no_guard",
+                    review_conditions=list(route.review_conditions),
+                    path_assumptions=list(route.path_assumptions), trace=list(route.flow.steps),
+                ) for route in representative_routes(routes)],
+                remediation=(
+                    "Verify the API caller and allow only intended local paths. Reject phar:// explicitly when accepting untrusted paths. "
+                    "stream_is_local() and phar.readonly do not establish that Phar metadata is safe."
+                    if phar else f"Avoid {sink.name}() on untrusted data; use a data-only format such as JSON."
+                ),
+                metadata={
+                    "engine": "taint", "source_assumption": "library_public_api_parameter" if assumed else "persistent_store_read_unverified" if persistent else "modeled_framework_request" if modeled else "observed_request",
+                    "analysis_kind": "source_to_sink_candidate",
+                    "methodology_reference": "S5135" if not phar else None,
+                    "analysis_status": "configured_local_path_review" if sink.path_assumptions else "conditional_api_exposure" if assumed else "conditional_persistent_data_flow" if persistent else "guarded_flow_review" if guarded else "unresolved_return_flow" if flow.uncertain else "modeled_source_to_sink" if modeled else "source_to_sink",
+                    "path_prefix_assumptions": list(sink.path_assumptions),
+                    "review_conditions": list(sink.review_conditions),
+                    "framework_dispatch_assumptions": list(dict.fromkeys(step.description for route in routes for step in route.flow.steps if step.description.startswith("Framework dispatch model:"))),
+                    "runtime_configuration_verified": False,
+                    "exploitability_verified": False,
+                    "sink_type": "PHAR_DESERIALIZATION" if phar else "DIRECT_UNSERIALIZE",
+                    "sink_argument": sink.argument, "sink_name": sink.name,
+                    "target_php_version": self.php_version or "unknown",
+                    "automatic_phar_metadata_requires": "PHP < 8.0" if phar else None,
+                    "alternative_flow_count": len(routes), "summary_converged": self.project.converged,
+                    "object_excluded_route_count": excluded_count,
+                    "distinct_route_count": len(records),
+                    "route_records": records,
+                    "route_totals": route_totals,
+                    "route_callers": route_callers,
+                    "route_callers_truncated": callers_truncated,
+                    "flow_evidence_limit": FLOW_EVIDENCE_LIMIT,
+                    "flow_evidence_truncated": len(routes) > FLOW_EVIDENCE_LIMIT,
+                    "prerequisites": (["An application caller passes attacker-controlled input."] if assumed else []) +
+                                     (["An attacker can write the same persisted record before this read and the code path is triggered."] if persistent else []) +
+                                     (["A reachable Phar archive and a PHP runtime with automatic metadata deserialization."] if phar else []) +
+                                     (["The igbinary extension must be installed at runtime."] if sink.name == "igbinary_unserialize" else []) +
+                                     ["Applicable object classes/gadgets must be loaded; exploitability is not established by taint alone."],
+                },
+            ))
+        return findings
 
-            # 1. Check if returns tainted value
-            for ret_node in find_nodes_by_type(body, "return_statement"):
-                for child in ret_node.children:
-                    if child.type not in ("return", ";"):
-                        is_t, steps, src = self._is_tainted_expression(child)
-                        if is_t:
-                            self.symbol_table.function_taint_sources[func_name] = (True, steps, src)
-                            break
+    def _build_sink_inventory(self, engine, candidates, implicit_phar):
+        """Account for each deserialization-related sink and its observed source status."""
+        routes = {}
+        for sink in candidates:
+            key = (
+                sink.location.file_path,
+                sink.location.start_line,
+                sink.location.start_col,
+                sink.argument,
+                sink.name,
+            )
+            routes.setdefault(key, []).append(sink.flow)
 
-            # 2. Check if parameter reaches a sink directly inside this function
-            for idx, param_var in enumerate(params):
-                for call_node in find_nodes_by_type(body, "function_call_expression"):
-                    call_fn = find_child_by_field(call_node, "function")
-                    if not call_fn:
+        entries = []
+        for scope, nodes in engine.nodes.items():
+            for node in nodes:
+                if node.type != "function_call_expression":
+                    continue
+                name = engine.call_name(node)
+                if name not in DESERIALIZATION_FUNCTIONS and name not in PATH_ARGUMENTS:
+                    continue
+                if self.project.resolve(engine, node):
+                    continue
+                location = get_node_location(node, self.file_path)
+                arg_indexes = (0,) if name in DESERIALIZATION_FUNCTIONS else PATH_ARGUMENTS[name]
+                for arg_index in arg_indexes:
+                    arg = engine.builtin_argument(node, arg_index)
+                    if arg is None:
                         continue
-                    call_fn_name = get_node_text(call_fn, self.source_bytes).strip("\\ ")
-                    call_text = get_node_text(call_node, self.source_bytes)
-                    if call_fn_name == "unserialize" and not self._is_unserialize_safe(call_node):
-                        if param_var in call_text:
-                            loc = get_node_location(call_node, self.file_path)
-                            if func_name not in self.symbol_table.function_sink_params:
-                                self.symbol_table.function_sink_params[func_name] = []
-                            self.symbol_table.function_sink_params[func_name].append((idx, "unserialize", loc))
-                    elif call_fn_name in PHAR_TRIGGER_SINKS:
-                        if param_var in call_text:
-                            loc = get_node_location(call_node, self.file_path)
-                            if func_name not in self.symbol_table.function_sink_params:
-                                self.symbol_table.function_sink_params[func_name] = []
-                            self.symbol_table.function_sink_params[func_name].append((idx, call_fn_name, loc))
-
-    def analyze(self) -> List[Finding]:
-        """Scan file AST for tainted data flows into unserialize and phar sinks."""
-        findings: List[Finding] = []
-
-        # Analyze sequentially through top-level and function bodies
-        self._trace_variable_assignments(self.root_node)
-        
-        # Check direct unserialize sinks
-        direct_findings = self._check_unserialize_sinks()
-        findings.extend(direct_findings)
-
-        # Check phar deserialization sinks
-        phar_findings = self._check_phar_sinks()
-        findings.extend(phar_findings)
-
-        # Check inter-procedural calls forwarding tainted parameters to sinks
-        if self.symbol_table and self.symbol_table.function_sink_params:
-            interproc_findings = self._check_interprocedural_calls()
-            findings.extend(interproc_findings)
-
-        return findings
-
-    def _check_interprocedural_calls(self) -> List[Finding]:
-        """Check calls to helper functions where arguments reach deserialization/phar sinks."""
-        findings = []
-        if not self.symbol_table:
-            return findings
-
-        for call_node in find_nodes_by_type(self.root_node, ["function_call_expression", "member_call_expression"]):
-            fn_node = find_child_by_field(call_node, "function") or find_child_by_field(call_node, "name")
-            if not fn_node:
-                continue
-
-            fn_name = get_node_text(fn_node, self.source_bytes).strip("\\ ")
-            if fn_name not in self.symbol_table.function_sink_params:
-                continue
-
-            sink_infos = self.symbol_table.function_sink_params[fn_name]
-            args_node = find_child_by_field(call_node, "arguments") or find_child_by_type(call_node, "arguments")
-            if not args_node:
-                continue
-
-            arg_list = [c for c in args_node.children if c.type not in ("(", ")", ",")]
-
-            for param_idx, sink_type, sink_loc in sink_infos:
-                if param_idx < len(arg_list):
-                    passed_arg = arg_list[param_idx]
-                    is_tainted, steps, source_name = self._is_tainted_expression(passed_arg)
-                    if is_tainted:
-                        call_loc = get_node_location(call_node, self.file_path)
-                        snippet = get_code_snippet(self.source_bytes, call_loc.start_line, call_loc.end_line)
-                        
-                        forward_step = TaintStep(
-                            location=call_loc,
-                            code_snippet=get_node_text(call_node, self.source_bytes),
-                            description=f"Tainted parameter passed into function `{fn_name}()` which passes it to `{sink_type}()` at {sink_loc}.",
-                            variable_name=get_node_text(passed_arg, self.source_bytes)
-                        )
-                        trace = steps + [forward_step]
-
-                        is_phar = sink_type in PHAR_TRIGGER_SINKS
-                        vuln_t = VulnerabilityType.PHAR_DESERIALIZATION if is_phar else VulnerabilityType.DIRECT_UNSERIALIZE
-                        sev = Severity.HIGH if is_phar else Severity.CRITICAL
-
-                        finding = Finding(
-                            id=f"INTERPROC-{call_loc.start_line}-{fn_name}",
-                            rule_id=f"php-interprocedural-{sink_type}-taint",
-                            vuln_type=vuln_t,
-                            title=f"Inter-procedural Insecure Deserialization via `{fn_name}()` -> `{sink_type}()`",
-                            description=(
-                                f"Tainted input from `{source_name}` is passed into helper function `{fn_name}()` at line {call_loc.start_line}, "
-                                f"which forwards it to sink `{sink_type}()` at {sink_loc.file_path}:{sink_loc.start_line}."
-                            ),
-                            severity=sev,
-                            confidence=Confidence.HIGH,
-                            location=call_loc,
-                            code_snippet=snippet,
-                            dataflow_trace=trace,
-                            cwe="CWE-502: Deserialization of Untrusted Data",
-                            owasp="A08:2021-Software and Data Integrity Failures",
-                            remediation=f"Validate or sanitize inputs before passing to `{fn_name}()` or refactor the callee sink."
-                        )
-                        findings.append(finding)
-
-        return findings
-
-    def _is_tainted_expression(self, expr_node: Node) -> Tuple[bool, List[TaintStep], Optional[str]]:
-        """Check if an AST expression is tainted by untrusted source or tainted variable."""
-        expr_text = get_node_text(expr_node, self.source_bytes).strip()
-
-        # 1. Direct superglobals (e.g. $_POST['data'])
-        for sg in SOURCES_SUPERGLOBALS:
-            if expr_text.startswith(sg):
-                step = TaintStep(
-                    location=get_node_location(expr_node, self.file_path),
-                    code_snippet=expr_text,
-                    description=f"Untrusted input source directly accessed via `{sg}`.",
-                    variable_name=sg
-                )
-                return True, [step], sg
-
-        # 2. php://input or input functions
-        if "php://input" in expr_text:
-            step = TaintStep(
-                location=get_node_location(expr_node, self.file_path),
-                code_snippet=expr_text,
-                description="Untrusted input read from `php://input` stream.",
-                variable_name="php://input"
-            )
-            return True, [step], "php://input"
-
-        # 3. Request object access ($request->get('param'), $request->input(...))
-        if any(req in expr_text for req in ("$request->", "$this->request->", "$_REQUEST")):
-            step = TaintStep(
-                location=get_node_location(expr_node, self.file_path),
-                code_snippet=expr_text,
-                description=f"Untrusted request parameter accessed: `{expr_text}`.",
-                variable_name=expr_text
-            )
-            return True, [step], expr_text
-
-        # 4. Check if single variable is already in tainted map
-        if expr_node.type == "variable_name" or expr_text.startswith("$"):
-            var_name = expr_text.split("[")[0].strip()
-            if var_name in self.tainted_vars:
-                prev_steps = self.tainted_vars[var_name]
-                step = TaintStep(
-                    location=get_node_location(expr_node, self.file_path),
-                    code_snippet=expr_text,
-                    description=f"Tainted variable `{var_name}` used.",
-                    variable_name=var_name
-                )
-                return True, prev_steps + [step], var_name
-
-        # 5. Check function call transformations or inter-procedural returns
-        if expr_node.type == "function_call_expression":
-            fn_node = find_child_by_field(expr_node, "function")
-            if fn_node:
-                fn_name = get_node_text(fn_node, self.source_bytes).strip("\\ ")
-                if fn_name in SAFE_FUNCTIONS:
-                    return False, [], None
-
-                # Check sprintf / printf dynamic phar formatting
-                if fn_name in ("sprintf", "printf"):
-                    args_node = find_child_by_field(expr_node, "arguments") or find_child_by_type(expr_node, "arguments")
-                    if args_node:
-                        arg_children = [c for c in args_node.children if c.type not in ("(", ")", ",")]
-                        if len(arg_children) >= 2:
-                            fmt_text = get_node_text(arg_children[0], self.source_bytes)
-                            has_phar = "phar://" in fmt_text
-                            for arg in arg_children[1:]:
-                                is_t, steps, vname = self._is_tainted_expression(arg)
-                                if is_t:
-                                    desc = (
-                                        "Untrusted input dynamically formatted into 'phar://' stream wrapper via sprintf()."
-                                        if has_phar else f"Tainted data passed through transformation function `{fn_name}()`."
-                                    )
-                                    step = TaintStep(
-                                        location=get_node_location(expr_node, self.file_path),
-                                        code_snippet=expr_text,
-                                        description=desc,
-                                        variable_name=vname
-                                    )
-                                    return True, steps + [step], vname
-
-                # Inter-procedural function return taint
-                if self.symbol_table and fn_name in self.symbol_table.function_taint_sources:
-                    is_t, ret_steps, ret_src = self.symbol_table.function_taint_sources[fn_name]
-                    step = TaintStep(
-                        location=get_node_location(expr_node, self.file_path),
-                        code_snippet=expr_text,
-                        description=f"Untrusted input received from user function `{fn_name}()` return value.",
-                        variable_name=ret_src
+                    key = (self.file_path, location.start_line, location.start_col, arg_index, name)
+                    flows = routes.get(key, ())
+                    evidence = []
+                    source_assumption = None
+                    phar_prefix_excluded = (
+                        name not in DESERIALIZATION_FUNCTIONS
+                        and not engine.phar_path_may_resolve_to_wrapper(arg)
                     )
-                    return True, ret_steps + [step], ret_src
-
-                args_node = find_child_by_field(expr_node, "arguments") or find_child_by_type(expr_node, "arguments")
-                if args_node:
-                    for arg in args_node.children:
-                        is_t, steps, vname = self._is_tainted_expression(arg)
-                        if is_t:
-                            step = TaintStep(
-                                location=get_node_location(expr_node, self.file_path),
-                                code_snippet=expr_text,
-                                description=f"Tainted data passed through transformation function `{fn_name}()`.",
-                                variable_name=vname
+                    if not engine.reachable(node, scope):
+                        disposition = "unreachable_in_scope_cfg"
+                        note = "No control-flow path from this lexical scope entry reaches the call in the supported statement CFG."
+                    elif phar_prefix_excluded:
+                        if flows:
+                            flow = min(flows, key=lambda item: (item.uncertain, len(item.steps)))
+                            source_assumption = (
+                                "observed_request" if flow.kind == "request"
+                                else "library_public_api_parameter" if flow.kind == "library_parameter"
+                                else flow.kind
                             )
-                            return True, steps + [step], vname
-
-        # 6. Check binary concatenation with dynamic Phar detection
-        if expr_node.type == "binary_expression":
-            left = find_child_by_field(expr_node, "left")
-            right = find_child_by_field(expr_node, "right")
-            left_text = get_node_text(left, self.source_bytes).strip() if left else ""
-            right_text = get_node_text(right, self.source_bytes).strip() if right else ""
-
-            left_t, left_steps, left_src = self._is_tainted_expression(left) if left else (False, [], None)
-            right_t, right_steps, right_src = self._is_tainted_expression(right) if right else (False, [], None)
-
-            if left_t:
-                if "phar://" in right_text or right_text in self.phar_prefix_vars:
-                    step = TaintStep(
-                        location=get_node_location(expr_node, self.file_path),
-                        code_snippet=expr_text,
-                        description="Untrusted input dynamically concatenated with 'phar://' stream wrapper protocol.",
-                        variable_name=left_src
-                    )
-                    return True, left_steps + [step], left_src
-                return True, left_steps, left_src
-
-            if right_t:
-                if "phar://" in left_text or left_text in self.phar_prefix_vars:
-                    step = TaintStep(
-                        location=get_node_location(expr_node, self.file_path),
-                        code_snippet=expr_text,
-                        description="Untrusted input dynamically concatenated with 'phar://' stream wrapper protocol.",
-                        variable_name=right_src
-                    )
-                    return True, right_steps + [step], right_src
-                return True, right_steps, right_src
-
-        # 7. Check string interpolation (encapsed_string)
-        if expr_node.type == "encapsed_string":
-            if "phar://" in expr_text:
-                for child in expr_node.children:
-                    c_t, c_steps, c_src = self._is_tainted_expression(child)
-                    if c_t:
-                        step = TaintStep(
-                            location=get_node_location(expr_node, self.file_path),
-                            code_snippet=expr_text,
-                            description="Untrusted input dynamically embedded inside 'phar://' string interpolation.",
-                            variable_name=c_src
+                            evidence = flow.steps
+                        disposition = "fixed_non_phar_path"
+                        note = "A fixed path prefix is incompatible with the phar:// wrapper, even when the suffix is request-controlled."
+                    elif flows:
+                        flow = min(
+                            flows,
+                            key=lambda item: (
+                                0 if item.kind == "request" else 1,
+                                item.uncertain,
+                                len(item.steps),
+                            ),
                         )
-                        return True, c_steps + [step], c_src
-
-        # 8. Check sub-nodes recursively
-        for child in expr_node.children:
-            if child.type in ("variable_name", "subscript_expression", "function_call_expression", "binary_expression"):
-                is_t, steps, vname = self._is_tainted_expression(child)
-                if is_t:
-                    return True, steps, vname
-
-        return False, [], None
-
-    def _trace_variable_assignments(self, scope_node: Node):
-        """Track variable assignments and propagate taint status."""
-        for assign_node in find_nodes_by_type(scope_node, ["assignment_expression", "augmented_assignment_expression"]):
-            left_node = find_child_by_field(assign_node, "left")
-            right_node = find_child_by_field(assign_node, "right")
-
-            if not left_node or not right_node:
-                continue
-
-            left_text = get_node_text(left_node, self.source_bytes).strip()
-            right_text = get_node_text(right_node, self.source_bytes).strip()
-
-            var_name = left_text.split("[")[0].strip()
-
-            # Record variables holding phar:// prefix
-            if "phar://" in right_text:
-                self.phar_prefix_vars.add(var_name)
-
-            # Check if right hand side is tainted
-            is_tainted, steps, source_name = self._is_tainted_expression(right_node)
-
-            if is_tainted:
-                assign_step = TaintStep(
-                    location=get_node_location(assign_node, self.file_path),
-                    code_snippet=f"{left_text} = {right_text}",
-                    description=f"Variable `{var_name}` assigned tainted value from `{source_name}`.",
-                    variable_name=var_name
-                )
-                self.tainted_vars[var_name] = steps + [assign_step]
-                self.known_clean_vars.discard(var_name)
-            else:
-                # If variable was reassigned a safe constant/sanitized value, untaint it
-                if var_name in self.tainted_vars and not any(sg in right_text for sg in SOURCES_SUPERGLOBALS):
-                    if var_name not in right_text:
-                        del self.tainted_vars[var_name]
-                if self._is_definitely_clean_expression(right_node):
-                    self.known_clean_vars.add(var_name)
-                else:
-                    self.known_clean_vars.discard(var_name)
-
-    def _is_definitely_clean_expression(self, node: Node) -> bool:
-        """Return true only for expressions that cannot carry request data."""
-        if node.type in {
-            "string", "encapsed_string", "integer", "float", "boolean",
-            "null", "array_creation_expression",
-        }:
-            # Interpolated strings can still contain variables.
-            if node.type == "encapsed_string":
-                return not any(child.type in ("variable_name", "subscript_expression") for child in node.children)
-            return True
-        if node.type == "function_call_expression":
-            fn_node = find_child_by_field(node, "function")
-            fn_name = get_node_text(fn_node, self.source_bytes).strip("\\ ") if fn_node else ""
-            return fn_name in SAFE_FUNCTIONS
-        return False
-
-    def _is_unserialize_safe(self, call_node: Node) -> bool:
-        """Check whether the options argument disables object construction."""
-        args_node = find_child_by_field(call_node, "arguments") or find_child_by_type(call_node, "arguments")
-        if not args_node:
-            return False
-        args = [child for child in args_node.children if child.type not in ("(", ")", ",")]
-        if len(args) < 2:
-            return False
-        options_text = get_node_text(args[1], self.source_bytes)
-        return bool(re.search(
-            r"['\"]allowed_classes['\"]\s*=>\s*(?:false\b|\[\s*\]|array\s*\(\s*\))",
-            options_text,
-            flags=re.IGNORECASE,
-        ))
-
-    def _check_unserialize_sinks(self) -> List[Finding]:
-        """Find calls to unserialize() taking tainted inputs."""
-        findings = []
-        for call_node in find_nodes_by_type(self.root_node, "function_call_expression"):
-            fn_node = find_child_by_field(call_node, "function")
-            if not fn_node:
-                continue
-
-            fn_name = get_node_text(fn_node, self.source_bytes).strip("\\ ")
-            if fn_name != "unserialize":
-                continue
-
-            # Check if safe options provided
-            if self._is_unserialize_safe(call_node):
-                continue
-
-            # Get first argument
-            args_node = find_child_by_field(call_node, "arguments") or find_child_by_type(call_node, "arguments")
-            if not args_node or not args_node.children:
-                continue
-
-            first_arg = None
-            for child in args_node.children:
-                if child.type in ("argument", "variable_name", "subscript_expression", "function_call_expression", "binary_expression"):
-                    first_arg = child
-                    break
-
-            if not first_arg:
-                continue
-
-            is_tainted, steps, source_name = self._is_tainted_expression(first_arg)
-            loc = get_node_location(call_node, self.file_path)
-            snippet = get_code_snippet(self.source_bytes, loc.start_line, loc.end_line)
-
-            if is_tainted:
-                sink_step = TaintStep(
-                    location=loc,
-                    code_snippet=get_node_text(call_node, self.source_bytes),
-                    description="Tainted data passed into `unserialize()` sink without `allowed_classes => false`.",
-                    variable_name=get_node_text(first_arg, self.source_bytes)
-                )
-                trace = steps + [sink_step]
-
-                finding = Finding(
-                    id=f"DESERIAL-DIRECT-{loc.start_line}",
-                    rule_id="php-insecure-unserialize-tainted",
-                    vuln_type=VulnerabilityType.DIRECT_UNSERIALIZE,
-                    title="Direct Insecure Deserialization via unserialize()",
-                    description=(
-                        f"Unsanitized user-controlled input from `{source_name}` reaches the "
-                        f"`unserialize()` sink at line {loc.start_line}. An attacker can supply a malicious serialized "
-                        f"object payload to trigger arbitrary Object Injection or POP Gadget Chains leading to RCE."
-                    ),
-                    severity=Severity.CRITICAL,
-                    confidence=Confidence.HIGH,
-                    location=loc,
-                    code_snippet=snippet,
-                    dataflow_trace=trace,
-                    cwe="CWE-502: Deserialization of Untrusted Data",
-                    owasp="A08:2021-Software and Data Integrity Failures",
-                    remediation=(
-                        "1. Avoid passing untrusted user input into `unserialize()`.\n"
-                        "2. Use safe data interchange formats such as JSON (`json_decode()` / `json_encode()`).\n"
-                        "3. If object deserialization is strictly necessary, pass `['allowed_classes' => false]` "
-                        "or specify an explicit whitelist of safe classes."
-                    )
-                )
-                findings.append(finding)
-            else:
-                arg_text = get_node_text(first_arg, self.source_bytes).strip()
-                var_name = arg_text.split("[")[0].strip()
-                if arg_text.startswith("$") and var_name not in self.known_clean_vars:
-                    finding = Finding(
-                        id=f"DESERIAL-SUSPICIOUS-{loc.start_line}",
-                        rule_id="php-unserialize-potential-taint",
-                        vuln_type=VulnerabilityType.DIRECT_UNSERIALIZE,
-                        title="Potential Insecure Deserialization via unserialize()",
-                        description=(
-                            f"Call to `unserialize({arg_text})` without `allowed_classes => false` detected. "
-                            f"If variable `{arg_text}` can be influenced by an external user, it poses an Object Injection risk."
-                        ),
-                        severity=Severity.HIGH,
-                        confidence=Confidence.MEDIUM,
-                        location=loc,
-                        code_snippet=snippet,
-                        cwe="CWE-502: Deserialization of Untrusted Data",
-                        owasp="A08:2021-Software and Data Integrity Failures",
-                        remediation="Use `json_decode()` instead or add `['allowed_classes' => false]`."
-                    )
-                    findings.append(finding)
-
-        return findings
-
-    def _check_phar_sinks(self) -> List[Finding]:
-        """Find filesystem function calls taking tainted input where 'phar://' stream wrapper may trigger deserialization."""
-        findings = []
-        for call_node in find_nodes_by_type(self.root_node, "function_call_expression"):
-            fn_node = find_child_by_field(call_node, "function")
-            if not fn_node:
-                continue
-
-            fn_name = get_node_text(fn_node, self.source_bytes).strip("\\ ")
-            if fn_name not in PHAR_TRIGGER_SINKS:
-                continue
-
-            args_node = find_child_by_field(call_node, "arguments") or find_child_by_type(call_node, "arguments")
-            if not args_node or not args_node.children:
-                continue
-
-            # First argument is typically the file path
-            first_arg = None
-            for child in args_node.children:
-                if child.type in ("argument", "variable_name", "subscript_expression", "function_call_expression", "binary_expression"):
-                    first_arg = child
-                    break
-
-            if not first_arg:
-                continue
-
-            is_tainted, steps, source_name = self._is_tainted_expression(first_arg)
-            if is_tainted:
-                loc = get_node_location(call_node, self.file_path)
-                snippet = get_code_snippet(self.source_bytes, loc.start_line, loc.end_line)
-                
-                sink_step = TaintStep(
-                    location=loc,
-                    code_snippet=get_node_text(call_node, self.source_bytes),
-                    description=f"Tainted file path passed into filesystem sink `{fn_name}()` which triggers Phar deserialization.",
-                    variable_name=get_node_text(first_arg, self.source_bytes)
-                )
-                trace = steps + [sink_step]
-
-                # Check if explicit phar wrapper was detected
-                has_explicit_phar = any("phar://" in s.description or "phar://" in s.code_snippet for s in steps) or "phar://" in get_node_text(call_node, self.source_bytes)
-                if has_explicit_phar:
-                    title = f"Critical Phar Insecure Deserialization via `{fn_name}()` [Explicit Wrapper Detected]"
-                    sev = Severity.CRITICAL
-                    desc = (
-                        f"Filesystem function `{fn_name}()` receives dynamically constructed `phar://` URL from `{source_name}` at line {loc.start_line}. "
-                        f"The code dynamically prepends or constructs a `phar://` stream wrapper with untrusted user input. "
-                        f"When PHP filesystem functions encounter a `phar://` wrapper, PHP automatically deserializes Phar archive metadata, "
-                        f"allowing attackers to execute POP gadget chains without direct `unserialize()` calls."
-                    )
-                else:
-                    title = f"Potential Phar Insecure Deserialization via `{fn_name}()`"
-                    sev = Severity.HIGH
-                    desc = (
-                        f"Filesystem function `{fn_name}()` receives tainted input from `{source_name}` at line {loc.start_line}. "
-                        f"In PHP, filesystem functions automatically deserialize Phar metadata when provided a `phar://` URL wrapper, "
-                        f"allowing attackers to execute POP gadget chains without direct `unserialize()` calls."
-                    )
-
-                finding = Finding(
-                    id=f"PHAR-DESERIAL-{loc.start_line}",
-                    rule_id="php-phar-insecure-deserialization",
-                    vuln_type=VulnerabilityType.PHAR_DESERIALIZATION,
-                    title=title,
-                    description=desc,
-                    severity=sev,
-                    confidence=Confidence.HIGH,
-                    location=loc,
-                    code_snippet=snippet,
-                    dataflow_trace=trace,
-                    cwe="CWE-502: Deserialization of Untrusted Data",
-                    owasp="A08:2021-Software and Data Integrity Failures",
-                    remediation=(
-                        "1. Validate and sanitize file paths against `phar://` stream wrappers before passing to filesystem functions.\n"
-                        "2. Ensure user-supplied paths do not begin with protocols (`phar://`, `zip://`, `compress.bzip2://`).\n"
-                        "3. Use `basename()` or strict path whitelisting.\n"
-                        "4. In PHP 8.0+, disable `phar.readonly` or avoid unvalidated filesystem calls."
-                    )
-                )
-                findings.append(finding)
-
-        return findings
+                        source_assumption = (
+                            "observed_request" if flow.kind == "request"
+                            else "library_public_api_parameter" if flow.kind == "library_parameter"
+                            else flow.kind
+                        )
+                        evidence = flow.steps
+                        if flow.kind == "framework_request":
+                            source_assumption = "modeled_framework_request"
+                            disposition = "modeled_framework_request"
+                            note = "A typed framework request API reaches the sink; verify its runtime origin."
+                        elif flow.kind == "request":
+                            disposition = "observed_request_unresolved" if flow.uncertain else "observed_request"
+                            note = "Tracked request data reaches this sink; verify remaining runtime and exploitability prerequisites."
+                        else:
+                            disposition = "conditional_library_api"
+                            note = "A public API parameter can reach this sink; an untrusted application caller is not established."
+                    elif name == "unserialize" and engine.unserialize_safe(node):
+                        disposition = "restricted_unserialize"
+                        note = "allowed_classes is false, preventing PHP object reconstruction at this call."
+                    elif name not in DESERIALIZATION_FUNCTIONS and not implicit_phar:
+                        disposition = "php8_phar_implicit_deserialization_inactive"
+                        note = "Implicit Phar metadata deserialization does not apply to the configured PHP 8.0+ runtime."
+                    else:
+                        prefix = engine.fixed_prefix(arg)
+                        if name not in DESERIALIZATION_FUNCTIONS and prefix and prefix.lower().startswith("phar://"):
+                            disposition = "fixed_phar_path"
+                            note = "The path has a statically identified phar:// prefix; determine whether the archive is attacker-controlled."
+                        elif name not in DESERIALIZATION_FUNCTIONS and prefix is not None:
+                            disposition = "fixed_non_phar_path"
+                            note = "The path prefix is statically fixed and does not identify a phar:// archive."
+                        else:
+                            disposition = "no_tracked_source"
+                            note = "No supported untrusted source was traced to this sink in this scan."
+                    entries.append(SinkInventoryEntry(
+                        location=location,
+                        sink_name=name,
+                        sink_argument=arg_index,
+                        disposition=disposition,
+                        source_assumption=source_assumption,
+                        evidence=evidence,
+                        note=note,
+                    ))
+        return entries

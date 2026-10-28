@@ -5,26 +5,59 @@ rules:
     confidence: HIGH
     cwe: "CWE-502: Deserialization of Untrusted Data"
     owasp: "A08:2021-Software and Data Integrity Failures"
-    remediation: "Replace unserialize() with json_decode() or supply ['allowed_classes' => false]."
+    remediation: "Do not pass untrusted input to unserialize(). Prefer a data-only format such as JSON; allowed_classes=false only prevents object reconstruction and is not a general trust boundary."
     pattern-either:
       - pattern: "unserialize($_GET[...])"
       - pattern: "unserialize($_POST[...])"
       - pattern: "unserialize($_COOKIE[...])"
       - pattern: "unserialize($_REQUEST[...])"
-      - pattern: "unserialize(base64_decode(...))"
-      - pattern: "unserialize(file_get_contents(...))"
     pattern-not:
       - pattern: "unserialize(..., ['allowed_classes' => false])"
       - pattern: "unserialize(..., array('allowed_classes' => false))"
+    metadata:
+      analysis_kind: direct_source_pattern
+      methodology_reference: S5135
 
   - id: php-unserialize-without-allowed-classes
-    message: "unserialize() called without restricting allowed_classes to false"
-    severity: HIGH
+    message: "Review unserialize() without allowed_classes=false: confirm the input is trusted and object reconstruction is intended"
+    severity: MEDIUM
     confidence: MEDIUM
     cwe: "CWE-502: Deserialization of Untrusted Data"
     owasp: "A08:2021-Software and Data Integrity Failures"
-    remediation: "Always specify ['allowed_classes' => false] when deserializing untrusted data."
+    remediation: "Do not deserialize untrusted data. Prefer JSON for data-only values; allowed_classes=false only restricts object reconstruction."
     pattern: "unserialize($INPUT)"
     pattern-not:
       - pattern: "unserialize($INPUT, ['allowed_classes' => false])"
       - pattern: "unserialize($INPUT, array('allowed_classes' => false))"
+    metadata:
+      analysis_kind: security_hotspot_review
+      methodology_reference: S4508
+
+  - id: php-unserialize-allows-all-classes
+    message: "unserialize() explicitly permits reconstruction of every PHP class; attacker-controlled serialized input can enable object injection"
+    severity: MEDIUM
+    confidence: HIGH
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Upgrade or remove unsafe object deserialization. If only data is needed, use JSON; otherwise restrict allowed_classes and ensure the serialized input is integrity-protected and inaccessible to attackers."
+    pattern-either:
+      - pattern: "unserialize($DATA, ['allowed_classes' => true])"
+      - pattern: "unserialize($DATA, array('allowed_classes' => true))"
+    metadata:
+      analysis_kind: security_hotspot_review
+      methodology_reference: S4508
+
+  - id: php-unserialize-review
+    message: "Review unserialize(): object injection requires untrusted serialized data and available gadget classes"
+    severity: MEDIUM
+    confidence: MEDIUM
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Do not deserialize untrusted data. For data-only values, use JSON; if PHP serialization is required, disable object classes and verify the caller."
+    pattern: "unserialize($DATA, ...)"
+    pattern-not:
+      - pattern: "unserialize($DATA, ['allowed_classes' => false])"
+      - pattern: "unserialize($DATA, array('allowed_classes' => false))"
+    metadata:
+      analysis_kind: security_hotspot_review
+      methodology_reference: S4508

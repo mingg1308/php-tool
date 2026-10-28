@@ -110,7 +110,7 @@ class LLMVerifier:
             system_instruction=SYSTEM_PROMPT,
             generation_config={"response_mime_type": "application/json"}
         )
-        response = model.generate_content(prompt, request_options={"timeout": 30, "retry": None})
+        response = model.generate_content(prompt, request_options={"timeout": 120, "retry": None})
         return response.text
 
     def _call_ollama(self, prompt: str) -> str:
@@ -147,9 +147,16 @@ class LLMVerifier:
 
         try:
             data = json.loads(cleaned)
+            verdict = data.get("verdict")
+            if verdict not in {"CONFIRMED", "LIKELY", "NEEDS_CONTEXT", "FALSE_POSITIVE"}:
+                verdict = "LIKELY" if data.get("is_vulnerable") else "NEEDS_CONTEXT"
             return LLMVerificationResult(
                 is_vulnerable=data["is_vulnerable"],
                 confidence_score=data["confidence_score"],
+                verdict=verdict,
+                reachability=str(data.get("reachability", "UNKNOWN")),
+                sanitization=str(data.get("sanitization", "UNKNOWN")),
+                exploitability=str(data.get("exploitability", "UNKNOWN")),
                 reasoning=str(data.get("reasoning", "")),
                 exploitability_assessment=str(data.get("exploitability_assessment", "UNKNOWN")),
                 prerequisites=list(data.get("prerequisites", [])),

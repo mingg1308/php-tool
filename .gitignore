@@ -1,40 +1,41 @@
-# Byte-compiled / optimized / DLL files
+﻿# Byte-compiled Python / caches
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Pytest & Coverage
 .pytest_cache/
 .coverage
 htmlcov/
 .coverage.*
 
-# Virtual Environments
+# Virtual environments and build output
 venv/
 .venv/
 env/
 ENV/
-
-# Distribution / Packaging
 build/
 dist/
 *.egg-info/
 .eggs/
 
-# IDE & Editor files
+# IDE and editor files
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
+~$*.docx
 
-# Environment & Secrets
+# Environment files and secrets
 .env
 .env.*
 
-# Generated reports & temporary scan outputs
-*.html
-*.sarif
-*.json
-html
-scan_workshop.json
+# Generated scanner reports (keep arbitrary JSON/HTML project data trackable)
+/*.sarif
+/*_report.json
+/scan_*.json
+/tcpdf*.json
+/monolog*.json
+/semgrep_*.json
+/TCPDF.html
+/reports/
+/html/

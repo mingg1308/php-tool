@@ -1,0 +1,29 @@
+rules:
+  - id: php-session-decode-direct-request-review
+    message: "Request data is passed directly to session_decode(); review session.serialize_handler, active session state, object classes and input validation"
+    severity: MEDIUM
+    confidence: MEDIUM
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Do not pass untrusted session-encoded data to session_decode(). Verify the session handler and keep session data under server-side integrity control."
+    pattern-either:
+      - pattern: "session_decode($_GET[...])"
+      - pattern: "session_decode($_POST[...])"
+      - pattern: "session_decode($_COOKIE[...])"
+      - pattern: "session_decode($_REQUEST[...])"
+    metadata:
+      analysis_kind: conditional_session_deserialization_review
+      runtime_prerequisites: "An active session and handler capable of reconstructing an object; loaded classes and reachable side effects must be verified."
+      documentation: "https://www.php.net/manual/en/function.session-decode.php"
+
+  - id: php-session-decode-review
+    message: "Review session_decode(): session-encoded data is decoded using the configured session handler; establish the input source and object reconstruction conditions"
+    severity: INFO
+    confidence: LOW
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Accept only trusted, integrity-protected session data and verify the configured session.serialize_handler before interpreting object injection risk."
+    pattern: "session_decode($DATA)"
+    metadata:
+      analysis_kind: session_deserialization_hotspot
+      documentation: "https://www.php.net/manual/en/function.session-decode.php"

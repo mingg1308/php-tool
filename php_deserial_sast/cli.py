@@ -4,6 +4,7 @@ Command Line Interface (CLI) for PHP Insecure Deserialization SAST Scanner.
 
 import sys
 import os
+import re
 
 if sys.platform == "win32":
     try:
@@ -31,6 +32,12 @@ from php_deserial_sast.rules.engine import RuleEngine
 console = Console(legacy_windows=False)
 
 
+def validate_php_version(ctx, param, value):
+    if value is not None and not re.fullmatch(r"\d+\.\d+(?:\.\d+)?", value):
+        raise click.BadParameter("Use a version such as 7.4 or 8.3.")
+    return value
+
+
 @click.group()
 @click.version_option("1.0.0", prog_name="php-deserial-sast")
 def main():
@@ -47,10 +54,21 @@ def main():
 @click.option("--taint/--no-taint", default=True, help="Enable/disable Source-to-Sink Taint Analysis.")
 @click.option("--gadgets/--no-gadgets", default=True, help="Enable/disable POP Gadget Chain Finder.")
 @click.option("--rules/--no-rules", default=True, help="Enable/disable Semgrep-like YAML Rule Engine.")
+@click.option("--library-mode/--application-mode", default=None, help="Assume public API parameters may be externally controlled, or disable that assumption. By default, Composer packages with type=library use library mode.")
+@click.option("--framework-models/--no-framework-models", default=True, help="Use explicit conditional framework dispatch contracts.")
+@click.option("--experimental-foreach-cfg", is_flag=True, help="Opt into experimental foreach CFG; large-project performance is not validated.")
+@click.option("--experimental-side-effects", is_flag=True, help="Enable experimental reference/global effects; may be slow on large projects.")
+@click.option("--demand-summaries/--eager-summaries", "experimental_demand_summaries", default=True, show_default=True, help="Compute return and enabled side-effect summaries on demand; eager mode evaluates all summaries for comparison.")
+@click.option("--experimental-demand-summaries", "legacy_demand_summaries", is_flag=True, hidden=True)
+@click.option("--php-version", callback=validate_php_version, help="Target PHP runtime, e.g. 7.4 or 8.3; unknown when omitted.")
 @click.option("--llm/--no-llm", default=False, help="Enable LLM verification for False Positive filtering.")
 @click.option("--llm-provider", type=click.Choice(["openai", "gemini", "ollama"], case_sensitive=False), default="openai", help="LLM Provider.")
 @click.option("--llm-model", type=str, default=None, help="Model name for LLM verification.")
 @click.option("--max-depth", type=int, default=6, help="Maximum POP chain graph search depth.")
+@click.option("--max-gadget-paths", type=click.IntRange(min=1), default=10000, help="Maximum sink paths examined by POP analysis; reaching the limit marks the scan incomplete.")
+@click.option("--max-gadget-expansions", type=click.IntRange(min=1), default=250000, help="Maximum call-graph edges traversed by POP analysis; reaching the limit marks the scan incomplete.")
+@click.option("--max-file-mb", type=click.FloatRange(min=0), default=0, help="File size limit in MiB; 0 scans all sizes. Exceeded limits are reported as incomplete scans.")
+@click.option("--max-ast-nodes", type=click.IntRange(min=0), default=0, help="AST traversal limit per file; 0 is unlimited. Does not limit parser allocation.")
 def scan_cmd(
     target,
     rules_dir,
@@ -60,10 +78,21 @@ def scan_cmd(
     taint,
     gadgets,
     rules,
+    library_mode,
+    framework_models,
+    experimental_foreach_cfg,
+    experimental_side_effects,
+    experimental_demand_summaries,
+    legacy_demand_summaries,
+    php_version,
     llm,
     llm_provider,
     llm_model,
-    max_depth
+    max_depth,
+    max_gadget_paths,
+    max_gadget_expansions,
+    max_file_mb,
+    max_ast_nodes
 ):
     """Scan a PHP codebase or file for Deserialization vulnerabilities and POP chains."""
     config = ScannerConfig(
@@ -72,11 +101,21 @@ def scan_cmd(
         enable_taint=taint,
         enable_gadgets=gadgets,
         enable_rules=rules,
+        library_mode=library_mode,
+        framework_models=framework_models,
+        experimental_foreach_cfg=experimental_foreach_cfg,
+        experimental_side_effects=experimental_side_effects,
+        experimental_demand_summaries=experimental_demand_summaries or legacy_demand_summaries,
+        php_version=php_version,
         enable_llm=llm,
         llm_provider=llm_provider,
         llm_model=llm_model,
         min_severity=Severity(severity.upper()),
         max_chain_depth=max_depth,
+        max_gadget_paths=max_gadget_paths,
+        max_gadget_expansions=max_gadget_expansions,
+        max_file_bytes=int(max_file_mb * 1024 * 1024),
+        max_ast_nodes=max_ast_nodes,
         output_format=output_format.lower(),
         output_file=output
     )

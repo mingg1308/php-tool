@@ -3,7 +3,7 @@ Data models and definitions for PHP Insecure Deserialization SAST Scanner.
 """
 
 from enum import Enum
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional, Any, Literal
 from pydantic import BaseModel, Field, StrictBool
 
 
@@ -33,6 +33,7 @@ class Confidence(str, Enum):
 
 
 class VulnerabilityType(str, Enum):
+    LIBRARY_API_EXPOSURE = "LIBRARY_API_EXPOSURE"
     DIRECT_UNSERIALIZE = "DIRECT_UNSERIALIZE"
     PHAR_DESERIALIZATION = "PHAR_DESERIALIZATION"
     POP_GADGET_CHAIN = "POP_GADGET_CHAIN"
@@ -80,6 +81,7 @@ class GadgetChain(BaseModel):
     sink_function: str  # e.g., "eval", "system", "call_user_func", "file_put_contents"
     sink_type: str  # "RCE", "FILE_WRITE", "FILE_READ", "FILE_DELETE", "CODE_EXEC"
     steps: List[GadgetStep]
+    candidate_serialized_properties: List[str] = Field(default_factory=list)
     length: int
     confidence: Confidence = Confidence.MEDIUM
     severity: Severity = Severity.HIGH
@@ -90,11 +92,37 @@ class GadgetChain(BaseModel):
 class LLMVerificationResult(BaseModel):
     is_vulnerable: StrictBool
     confidence_score: float = Field(ge=0.0, le=1.0)
+    verdict: Literal["CONFIRMED", "LIKELY", "NEEDS_CONTEXT", "FALSE_POSITIVE"] = "NEEDS_CONTEXT"
+    reachability: str = "UNKNOWN"
+    sanitization: str = "UNKNOWN"
+    exploitability: str = "UNKNOWN"
     reasoning: str
     exploitability_assessment: str
     prerequisites: List[str] = Field(default_factory=list)
     suggested_poc: Optional[str] = None
     remediation: Optional[str] = None
+
+
+class FlowEvidence(BaseModel):
+    """One retained static route, not an assertion of exploitability."""
+    source_kind: str
+    source_origin: str
+    source_parameter: int = -1
+    source_fields: List[Any] = Field(default_factory=list)
+    uncertain: bool = False
+    guard_status: Literal["no_guard", "unrecognized_guard"] = "no_guard"
+    review_conditions: List[str] = Field(default_factory=list)
+    path_assumptions: List[str] = Field(default_factory=list)
+    trace: List[TaintStep] = Field(default_factory=list)
+
+
+class EvidenceAssessment(BaseModel):
+    potential_impact: Severity
+    evidence_level: Literal["syntactic_review", "candidate_call_chain", "assumed_api_flow", "assumed_persistent_flow", "modeled_source_flow", "observed_source_flow", "unresolved_flow"]
+    detection_level: Literal["direct_untrusted_deserialization", "conditional_path", "review_candidate"] = "review_candidate"
+    analysis_completeness: Literal["within_model", "limited"]
+    limitations: List[str] = Field(default_factory=list)
+    exploitability_verified: bool = False
 
 
 class Finding(BaseModel):
@@ -114,9 +142,22 @@ class Finding(BaseModel):
     remediation: Optional[str] = None
     llm_verification: Optional[LLMVerificationResult] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    flow_evidence: List[FlowEvidence] = Field(default_factory=list)
+    assessment: Optional[EvidenceAssessment] = None
+
+
+class SinkInventoryEntry(BaseModel):
+    location: CodeLocation
+    sink_name: str
+    sink_argument: int
+    disposition: str
+    source_assumption: Optional[str] = None
+    evidence: List[TaintStep] = Field(default_factory=list)
+    note: str = ""
 
 
 class ScanSummary(BaseModel):
+    api_exposure_count: int = 0
     total_files_discovered: int = 0
     total_files_scanned: int = 0
     files_with_errors: int = 0
@@ -140,9 +181,11 @@ class ScanError(BaseModel):
 
 
 class ScanResult(BaseModel):
+    analysis: Dict[str, Any] = Field(default_factory=dict)
     target_path: str
     summary: ScanSummary
     findings: List[Finding]
+    sink_inventory: List[SinkInventoryEntry] = Field(default_factory=list)
     gadget_chains: List[GadgetChain] = Field(default_factory=list)
     all_classes: List[str] = Field(default_factory=list)
     errors: List[ScanError] = Field(default_factory=list)

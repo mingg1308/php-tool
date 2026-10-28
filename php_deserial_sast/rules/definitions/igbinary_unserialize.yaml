@@ -1,0 +1,9 @@
+rules:
+  - id: php-igbinary-unserialize-review
+    message: "Review igbinary_unserialize(): reconstructed objects can invoke PHP magic methods when the input is untrusted"
+    severity: MEDIUM
+    confidence: MEDIUM
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    owasp: "A08:2021-Software and Data Integrity Failures"
+    remediation: "Do not decode attacker-controlled igbinary data into PHP objects; use a data-only format or verify a trusted integrity boundary."
+    pattern: "igbinary_unserialize($DATA)"
