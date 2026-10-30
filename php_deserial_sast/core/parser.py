@@ -26,8 +26,10 @@ class PHPParser:
         parse_bytes = _normalize_string_nuls(code_bytes)
         tree = self.parser.parse(parse_bytes)
         if tree.root_node.has_error:
-            parse_bytes = _normalize_readonly_compatibility(parse_bytes, tree.root_node)
-            tree = self.parser.parse(parse_bytes)
+            normalized = _normalize_readonly_compatibility(parse_bytes, tree.root_node)
+            if normalized != parse_bytes:
+                parse_bytes = normalized
+                tree = self.parser.parse(parse_bytes)
             normalized = _normalize_legacy_string_offsets(parse_bytes, tree.root_node)
             if normalized != parse_bytes:
                 tree = self.parser.parse(normalized)
@@ -48,6 +50,8 @@ def _normalize_readonly_compatibility(source, root):
     visibility, type and parameter spans retain their original source positions.
     Original bytes remain authoritative for symbol names and report snippets.
     """
+    if not re.search(rb"\breadonly\b", source, re.I):
+        return source
     protected = [(n.start_byte, n.end_byte) for n in find_nodes_by_type(
         root, ("string", "encapsed_string", "comment", "heredoc", "nowdoc", "text"))]
     result = bytearray(source)
@@ -111,6 +115,8 @@ def _normalize_legacy_string_offsets(source: bytes, root_node=None) -> bytes:
     snippets, and diagnostics.
     """
 
+    if not _LEGACY_BRACE_OFFSET.search(source):
+        return source
     protected = []
     if root_node is not None:
         protected = [(n.start_byte, n.end_byte) for n in find_nodes_by_type(
@@ -183,6 +189,8 @@ class ASTIndex:
         "expression_statement", "augmented_assignment_expression", "binary_expression",
         "foreach_statement", "echo_statement",
         "member_access_expression", "nullsafe_member_access_expression", "object_creation_expression",
+        "include_expression", "include_once_expression",
+        "require_expression", "require_once_expression",
     }
     SEMANTIC = TYPES - {"namespace_definition", "namespace_use_declaration", "assignment_expression", "subscript_expression", "expression_statement", "foreach_statement", "echo_statement"}
 
@@ -198,6 +206,10 @@ class ASTIndex:
 
     def find(self, types):
         types = (types,) if isinstance(types, str) else types
+        if len(types) == 1:
+            # The index is populated by a preorder traversal, so one node
+            # type is already ordered by source position.
+            return self.by_type.get(types[0], ())
         return sorted((n for t in types for n in self.by_type.get(t, ())), key=lambda n: n.start_byte)
 
     @property

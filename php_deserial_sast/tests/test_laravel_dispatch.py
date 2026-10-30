@@ -87,6 +87,52 @@ class LaravelDispatchTests(unittest.TestCase):
         self.assertTrue(self.scan({'Encrypter.php': ENCRYPTER,
                                    'EncryptCookies.php': unsafe_cookie}))
 
+    def test_static_serialization_default_is_conditional_review(self):
+        patched_cookie = COOKIE.replace(
+            '  protected $encrypter;',
+            '  protected $encrypter; protected static $serialize = false; '
+            'public static function serialized($name) { return static::$serialize; }',
+        ).replace('decrypt($cookie);', "decrypt($cookie, static::serialized('session'));" )
+        findings = self.scan({'Encrypter.php': ENCRYPTER,
+                              'EncryptCookies.php': patched_cookie})
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity.value, 'MEDIUM')
+        self.assertEqual(findings[0].metadata['analysis_status'],
+                         'default_serialization_disabled_review')
+        enabled = patched_cookie.replace('$serialize = false', '$serialize = true')
+        findings = self.scan({'Encrypter.php': ENCRYPTER,
+                              'EncryptCookies.php': enabled})
+        self.assertTrue(findings)
+        self.assertEqual(findings[0].severity.value, 'HIGH')
+        subclass = '''<?php
+namespace App;
+class CustomCookies extends \\Illuminate\\Cookie\\Middleware\\EncryptCookies {
+  protected static $serialize = true;
+}
+'''
+        findings = self.scan({'Encrypter.php': ENCRYPTER,
+                              'EncryptCookies.php': patched_cookie,
+                              'CustomCookies.php': subclass})
+        self.assertTrue(findings)
+        self.assertEqual(findings[0].severity.value, 'HIGH')
+
+    def test_static_serialization_helper_chain(self):
+        cookie = COOKIE.replace(
+            '  protected $encrypter;',
+            '  protected $encrypter; protected static $serialize = false; '
+            'public static function serialized($name) { return static::$serialize; }',
+        ).replace('decrypt($cookie);', 'decrypt($cookie, static::serialized($cookie));')
+        csrf = CSRF.replace(
+            '  protected $encrypter;',
+            '  protected $encrypter; public static function serialized() {'
+            " return \\Illuminate\\Cookie\\Middleware\\EncryptCookies::serialized('XSRF-TOKEN'); }",
+        ).replace('decrypt($header);', 'decrypt($header, static::serialized());')
+        findings = self.scan({'Encrypter.php': ENCRYPTER,
+                              'EncryptCookies.php': cookie,
+                              'VerifyCsrfToken.php': csrf})
+        self.assertTrue(findings)
+        self.assertTrue(all(f.severity.value == 'MEDIUM' for f in findings))
+
     def test_conditional_assignment_reaches_true_branch_only(self):
         source = '''<?php
 function test($flag) {

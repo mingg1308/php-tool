@@ -1,20 +1,39 @@
 """Uploaded serialized objects and their conditional later dispatch."""
 
 import tempfile
+import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from php_deserial_sast.config import ScannerConfig
 from php_deserial_sast.scanner import PHPDeserializationScanner
+from php_deserial_sast.core.deserialized_dispatch import _reachable_sinks
 
 
 class UploadedSessionDispatchTests(unittest.TestCase):
-    def scan(self, files):
+    def test_session_method_search_marks_depth_limit(self):
+        class Graph:
+            def get_successors(self, node):
+                return {'Demo::run': [('next', None)],
+                        'next': [('later', None)]}.get(node, [])
+
+        owner = SimpleNamespace(full_name='Demo', name='Demo')
+        method = SimpleNamespace(name='run')
+        sinks, truncated = _reachable_sinks(Graph(), owner, method, max_depth=1)
+        self.assertEqual(sinks, [])
+        self.assertTrue(truncated)
+
+    def scan(self, files, extra_files=None):
         with tempfile.TemporaryDirectory() as directory:
             for name, source in files.items():
                 path = Path(directory, name)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text('<?php\n' + source, encoding='utf-8')
+            for name, content in (extra_files or {}).items():
+                path = Path(directory, name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding='utf-8')
             return PHPDeserializationScanner(ScannerConfig(
                 target_path=directory, enable_llm=False, php_version='7.3',
             )).scan()
@@ -39,6 +58,13 @@ class UploadedSessionDispatchTests(unittest.TestCase):
         run = next(call for call in dispatch['calls'] if call['method'] == 'run')
         calculator = next(cls for cls in run['candidate_classes'] if cls['class'] == 'Calculator')
         self.assertTrue(any(sink['function'] == 'eval' for sink in calculator['dangerous_sinks']))
+        session_routes = [route for route in result.routes
+                          if route.route_kind == 'candidate_session_dispatch'
+                          and route.entry_class == 'Calculator']
+        self.assertTrue(session_routes)
+        self.assertTrue(all(route.status == 'conditional' and not route.runtime_verified
+                            and route.session_key == 'hero' and route.store and route.trigger
+                            for route in session_routes))
         fight = next(call for call in dispatch['calls'] if call['method'] == 'fight')
         override = next(cls for cls in fight['candidate_classes'] if cls['class'] == 'TrumCuoi')
         self.assertTrue(override['overrides_parent_method'])
@@ -54,6 +80,23 @@ class UploadedSessionDispatchTests(unittest.TestCase):
         self.assertFalse(result.errors)
         flow = next(f for f in result.findings if f.rule_id == 'php-unserialize-tainted-input')
         self.assertNotIn('deserialized_session_dispatch', flow.metadata)
+        self.assertFalse(any(route.route_kind == 'candidate_session_dispatch'
+                             for route in result.routes))
+
+    def test_dispatch_candidate_cap_reports_unexamined_classes(self):
+        classes = ' '.join('class Candidate%d { function run() {} }' % index
+                           for index in range(30))
+        result = self.scan({
+            'load.php': "$obj=unserialize($_POST['data']); $_SESSION['hero']=$obj;",
+            'play.php': "$_SESSION['hero']->run();",
+            'classes.php': classes,
+        })
+        finding = next(f for f in result.findings
+                       if f.rule_id == 'php-unserialize-tainted-input')
+        call = finding.metadata['deserialized_session_dispatch']['calls'][0]
+        self.assertEqual(call['candidate_class_count'], 24)
+        self.assertEqual(call['candidate_classes_unexamined'], 6)
+        self.assertTrue(call['candidate_classes_truncated'])
 
     def test_array_element_saved_to_session_and_rendered_later(self):
         result = self.scan({
@@ -149,6 +192,176 @@ class UploadedSessionDispatchTests(unittest.TestCase):
         self.assertTrue(call['session_bootstrap']['session_start_on_both_routes'])
         self.assertFalse(call['session_bootstrap']['session_identity_and_request_order_verified'])
         self.assertTrue(call['cross_request_execution_unverified'])
+        route = next(route for route in result.routes
+                     if route.route_kind == 'candidate_session_dispatch'
+                     and route.entry_class == 'Calculator')
+        self.assertEqual(len(route.bootstrap_entrypoints), 2)
+        self.assertTrue(route.session_start_on_both_routes)
+        self.assertFalse(route.runtime_verified)
+
+    def test_self_bootstrapped_load_endpoint_pairs_with_reader(self):
+        result = self.scan({
+            'load.php': ("session_start(); include('classes.php'); "
+                         "$hero=unserialize($_POST['hero']); $_SESSION['hero']=$hero;"),
+            'play.php': "$_SESSION['hero']->run();",
+            'index.php': "session_start(); include('classes.php'); include('play.php');",
+            'classes.php': 'class Calculator {function run(){eval("1");}}',
+        })
+        self.assertFalse(result.errors)
+        flow = next(f for f in result.findings if f.rule_id == 'php-unserialize-tainted-input')
+        call = flow.metadata['deserialized_session_dispatch']['calls'][0]
+        calculator = next(c for c in call['candidate_classes'] if c['class'] == 'Calculator')
+        self.assertEqual(calculator['class_loading'], 'included')
+        self.assertEqual(len(call['bootstrap_entrypoints']), 2)
+        self.assertTrue(call['session_bootstrap']['session_start_on_both_routes'])
+        self.assertFalse(call['session_bootstrap']['session_identity_and_request_order_verified'])
+
+    def test_dormant_session_start_does_not_make_file_an_entrypoint(self):
+        result = self.scan({
+            'load.php': ("function dormant(){session_start();} "
+                         "$hero=unserialize($_POST['hero']); $_SESSION['hero']=$hero;"),
+            'play.php': "$_SESSION['hero']->run();",
+            'index.php': "session_start(); include('classes.php'); include('play.php');",
+            'classes.php': 'class Calculator {function run(){eval("1");}}',
+        })
+        flow = next(f for f in result.findings if f.rule_id == 'php-unserialize-tainted-input')
+        call = flow.metadata['deserialized_session_dispatch']['calls'][0]
+        self.assertFalse(call['session_bootstrap']['session_start_on_both_routes'])
+        self.assertFalse(call['bootstrap_entrypoints'])
+
+    def test_fixed_magic_constant_includes_connect_both_routes(self):
+        result = self.scan({
+            'load.php': ("session_start(); require __DIR__ . '/classes.php'; "
+                         "$hero=unserialize($_POST['hero']); $_SESSION['hero']=$hero;"),
+            'play.php': "$_SESSION['hero']->run();",
+            'index.php': ("session_start(); require dirname(__FILE__) . '/classes.php'; "
+                          "include __DIR__ . '/play.php';"),
+            'classes.php': 'class Calculator {function run(){eval("1");}}',
+        })
+        self.assertFalse(result.errors)
+        flow = next(f for f in result.findings if f.rule_id == 'php-unserialize-tainted-input')
+        call = flow.metadata['deserialized_session_dispatch']['calls'][0]
+        calculator = next(c for c in call['candidate_classes'] if c['class'] == 'Calculator')
+        self.assertEqual(calculator['class_loading'], 'included')
+        self.assertTrue(call['session_bootstrap']['session_start_on_both_routes'])
+
+    def test_request_dependent_include_does_not_connect_reader(self):
+        result = self.scan({
+            'load.php': ("session_start(); include('classes.php'); "
+                         "$hero=unserialize($_POST['hero']); $_SESSION['hero']=$hero;"),
+            'play.php': "$_SESSION['hero']->run();",
+            'index.php': ("session_start(); include('classes.php'); "
+                          "include __DIR__ . '/' . $_GET['page'];"),
+            'classes.php': 'class Calculator {function run(){eval("1");}}',
+        })
+        flow = next(f for f in result.findings if f.rule_id == 'php-unserialize-tainted-input')
+        call = flow.metadata['deserialized_session_dispatch']['calls'][0]
+        self.assertFalse(call['session_bootstrap']['session_start_on_both_routes'])
+        self.assertFalse(call['bootstrap_entrypoints'])
+
+    def test_shadowed_dirname_does_not_prove_class_loading(self):
+        result = self.scan({
+            'load.php': ("session_start(); include('classes.php'); "
+                         "$hero=unserialize($_POST['hero']); $_SESSION['hero']=$hero;"),
+            'play.php': "$_SESSION['hero']->run();",
+            'index.php': ("namespace Demo; function dirname($path){return '/other';} "
+                          "session_start(); include dirname(__FILE__) . '/classes.php'; "
+                          "include __DIR__ . '/play.php';"),
+            'classes.php': 'class Calculator {function run(){eval("1");}}',
+        })
+        flow = next(f for f in result.findings if f.rule_id == 'php-unserialize-tainted-input')
+        call = flow.metadata['deserialized_session_dispatch']['calls'][0]
+        calculator = next(c for c in call['candidate_classes'] if c['class'] == 'Calculator')
+        self.assertEqual(calculator['class_loading'], 'unknown')
+
+    def test_conditional_literal_include_does_not_prove_class_loading(self):
+        result = self.scan({
+            'load.php': ("session_start(); include('classes.php'); "
+                         "$hero=unserialize($_POST['hero']); $_SESSION['hero']=$hero;"),
+            'play.php': "$_SESSION['hero']->run();",
+            'index.php': ("session_start(); if ($_GET['enable']) "
+                          "{ include __DIR__ . '/classes.php'; } "
+                          "include __DIR__ . '/play.php';"),
+            'classes.php': 'class Calculator {function run(){eval("1");}}',
+        })
+        flow = next(f for f in result.findings if f.rule_id == 'php-unserialize-tainted-input')
+        call = flow.metadata['deserialized_session_dispatch']['calls'][0]
+        calculator = next(c for c in call['candidate_classes'] if c['class'] == 'Calculator')
+        self.assertEqual(calculator['class_loading'], 'unknown')
+
+    def test_class_included_after_sink_and_render_is_not_proven_loaded(self):
+        result = self.scan({
+            'load.php': "$hero=unserialize($_POST['hero']); $_SESSION['hero']=$hero;",
+            'play.php': "$_SESSION['hero']->run();",
+            'classes.php': 'class Calculator {function run(){eval("1");}}',
+            'index.php': ("include('load.php'); include('play.php'); "
+                          "include('classes.php');"),
+        })
+        finding = next(f for f in result.findings
+                       if f.rule_id == 'php-unserialize-tainted-input')
+        call = finding.metadata['deserialized_session_dispatch']['calls'][0]
+        calculator = next(c for c in call['candidate_classes']
+                          if c['class'] == 'Calculator')
+        self.assertEqual(calculator['class_loading'], 'unknown')
+        route = next(route for route in result.routes
+                     if route.route_kind == 'candidate_session_dispatch'
+                     and route.entry_class == 'Calculator')
+        self.assertIn('class_loading_unverified', route.missing_edges)
+
+    def test_conditional_sink_include_before_class_does_not_prove_loading(self):
+        result = self.scan({
+            'load.php': "$hero=unserialize($_POST['hero']); $_SESSION['hero']=$hero;",
+            'play.php': "$_SESSION['hero']->run();",
+            'classes.php': 'class Calculator {function run(){eval("1");}}',
+            'index.php': ("if ($_GET['load']) include('load.php'); "
+                          "if ($_GET['play']) include('play.php'); "
+                          "include('classes.php');"),
+        })
+        finding = next(f for f in result.findings
+                       if f.rule_id == 'php-unserialize-tainted-input')
+        call = finding.metadata['deserialized_session_dispatch']['calls'][0]
+        calculator = next(c for c in call['candidate_classes']
+                          if c['class'] == 'Calculator')
+        self.assertEqual(calculator['class_loading'], 'unknown')
+
+    def test_composer_psr4_is_candidate_only_when_loader_precedes_routes(self):
+        common = {
+            'load.php': "$hero=unserialize($_POST['hero']); $_SESSION['hero']=$hero;",
+            'play.php': "$_SESSION['hero']->run();",
+            'src/Gadget.php': ('namespace App; class Gadget {'
+                               'function run(){system("id");}}'),
+            'vendor/autoload.php': '',
+        }
+        composer = json.dumps({'autoload': {'psr-4': {'App\\': 'src/'}}})
+        for loader_first, expected in ((True, 'composer_autoload_candidate'),
+                                       (False, 'unknown')):
+            with self.subTest(loader_first=loader_first):
+                index = ("require('vendor/autoload.php'); " if loader_first else '')
+                index += "include('load.php'); include('play.php');"
+                if not loader_first:
+                    index += "require('vendor/autoload.php');"
+                result = self.scan({**common, 'index.php': index},
+                                   extra_files={'composer.json': composer})
+                finding = next(f for f in result.findings
+                               if f.rule_id == 'php-unserialize-tainted-input')
+                call = finding.metadata['deserialized_session_dispatch']['calls'][0]
+                gadget = next(c for c in call['candidate_classes']
+                              if c['class'] == 'App\\Gadget')
+                self.assertEqual(gadget['class_loading'], expected)
+                route = next(route for route in result.routes
+                             if route.route_kind == 'candidate_session_dispatch'
+                             and route.entry_class == 'App\\Gadget')
+                self.assertEqual(route.class_loading, expected)
+                self.assertFalse(route.runtime_verified)
+        invalid = json.dumps({'autoload': {'psr-4': {'App': 'src/'}}})
+        result = self.scan({**common, 'index.php': (
+            "require('vendor/autoload.php'); include('load.php'); include('play.php');")},
+            extra_files={'composer.json': invalid})
+        finding = next(f for f in result.findings
+                       if f.rule_id == 'php-unserialize-tainted-input')
+        call = finding.metadata['deserialized_session_dispatch']['calls'][0]
+        gadget = next(c for c in call['candidate_classes'] if c['class'] == 'App\\Gadget')
+        self.assertEqual(gadget['class_loading'], 'unknown')
 
     def test_definite_session_replacement_blocks_later_method_candidate(self):
         result = self.scan({

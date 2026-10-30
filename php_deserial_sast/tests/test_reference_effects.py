@@ -4,6 +4,48 @@ from php_deserial_sast.tests.test_dataflow_regression import analyze
 
 
 class ReferenceEffectTests(unittest.TestCase):
+    def test_budget_fallback_keeps_baseline_findings_and_marks_coverage(self):
+        import tempfile
+        from pathlib import Path
+        from php_deserial_sast.config import ScannerConfig
+        from php_deserial_sast.scanner import PHPDeserializationScanner
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, 'reference.php')
+            path.write_text("<?php function fill(&$x){$x=$_GET['x'];} $a=''; fill($a); unserialize($a);", encoding='utf8')
+            baseline = PHPDeserializationScanner(ScannerConfig(
+                target_path=str(path), enable_gadgets=False)).scan()
+            limited = PHPDeserializationScanner(ScannerConfig(
+                target_path=str(path), enable_gadgets=False,
+                experimental_side_effects=True, max_side_effect_seconds=1e-9)).scan()
+            signature = lambda result: {(f.rule_id, f.location.start_line, f.location.start_col)
+                                        for f in result.findings}
+            self.assertEqual(signature(limited), signature(baseline))
+            self.assertEqual(limited.analysis['interprocedural_side_effects']['status'], 'budget_fallback')
+            self.assertFalse(limited.analysis['interprocedural_side_effects']['enabled'])
+            self.assertTrue(limited.analysis['interprocedural_side_effects']['requested'])
+            self.assertEqual(limited.analysis['interprocedural_side_effects']['attempted_summary_evaluations'], 0)
+            self.assertEqual([error.phase for error in limited.errors], ['side_effect_budget'])
+
+    def test_binding_budget_falls_back_without_partial_findings(self):
+        import tempfile
+        from pathlib import Path
+        from php_deserial_sast.config import ScannerConfig
+        from php_deserial_sast.scanner import PHPDeserializationScanner
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, 'reference.php')
+            path.write_text("<?php function fill(&$x){$x=$_GET['x'];} function wrap(&$p){fill($p);} $a=''; wrap($a); unserialize($a);", encoding='utf8')
+            base = PHPDeserializationScanner(ScannerConfig(target_path=str(path), enable_gadgets=False)).scan()
+            limited = PHPDeserializationScanner(ScannerConfig(
+                target_path=str(path), enable_gadgets=False, experimental_side_effects=True,
+                max_side_effect_seconds=0, max_side_effect_bindings=1)).scan()
+            signature = lambda result: {(f.rule_id, f.location.start_line, f.location.start_col)
+                                        for f in result.findings}
+            self.assertEqual(signature(limited), signature(base))
+            self.assertEqual(limited.analysis['interprocedural_side_effects']['status'], 'budget_fallback')
+            self.assertEqual(limited.analysis['interprocedural_side_effects']['attempted_bindings'], 2)
+            self.assertEqual([error.phase for error in limited.errors], ['side_effect_budget'])
+
     def test_effects_are_opt_in(self):
         import tempfile
         from pathlib import Path

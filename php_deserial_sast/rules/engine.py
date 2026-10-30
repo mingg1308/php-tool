@@ -127,13 +127,15 @@ class RuleEngine:
         except Exception as e:
             self.load_errors.append((file_path, f"{type(e).__name__}: {e}"))
 
-    def evaluate_file(self, file_path: str, source_bytes: bytes, root_node: Node, node_index=None) -> List[Finding]:
+    def evaluate_file(self, file_path: str, source_bytes: bytes, root_node: Node, node_index=None,
+                      file_flow=None) -> List[Finding]:
         """Evaluate all loaded rules against a file's AST with AST subsumption filtering."""
         findings: List[Finding] = []
         file_text = None
         source_lines = None
         content_lower = source_bytes.lower()
         candidate_cache = {}
+        function_call_index = None
 
         for rule in self.rules:
             # Determine appropriate AST candidate types based on rule target
@@ -152,8 +154,6 @@ class RuleEngine:
             identifiers = [re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", p) for p in patterns if p]
             if identifiers and all(identifiers) and not any(m.group(1).lower().encode() in content_lower for m in identifiers):
                 continue
-            if file_text is None:
-                file_text = source_bytes.decode("utf-8", errors="replace")
             is_class_rule = any("class " in p for p in patterns if p)
             is_func_rule = any("function " in p for p in patterns if p)
 
@@ -178,15 +178,70 @@ class RuleEngine:
                     if compiled is not None and compiled[0].type not in candidate_types:
                         candidate_types.append(compiled[0].type)
             candidate_key = tuple(candidate_types)
-            if candidate_key not in candidate_cache:
-                candidate_cache[candidate_key] = node_index.find(candidate_types) if node_index is not None else list(find_nodes_by_type(root_node, candidate_types))
-            candidate_nodes = candidate_cache[candidate_key]
-
+            # Every direct literal function pattern can only match a call
+            # with that exact callee. Index once instead of trying every rule
+            # against every call/statement in a large project file.
+            literal_functions = []
+            literal_patterns = {}
+            for pattern in patterns:
+                compiled = self.matcher._expression_pattern(pattern) if pattern else None
+                if compiled is None or compiled[0].type != 'function_call_expression':
+                    literal_functions = []
+                    literal_patterns = {}
+                    break
+                callee = compiled[0].child_by_field_name('function')
+                if callee is None or callee.type not in {'name', 'qualified_name'}:
+                    literal_functions = []
+                    literal_patterns = {}
+                    break
+                name = get_node_text(callee, compiled[1]).strip('\\').lower()
+                literal_functions.append(name)
+                literal_patterns.setdefault(name, []).append(pattern)
+            if literal_functions:
+                if function_call_index is None:
+                    function_call_index = {}
+                    calls = (node_index.by_type.get('function_call_expression', ())
+                             if node_index is not None else
+                             find_nodes_by_type(root_node, 'function_call_expression'))
+                    for call in calls:
+                        callee = call.child_by_field_name('function')
+                        if callee is None:
+                            continue
+                        name = get_node_text(callee, source_bytes).strip('\\').lower()
+                        function_call_index.setdefault(name, []).append(call)
+                candidate_nodes = sorted(
+                    (node for name in set(literal_functions)
+                     for node in function_call_index.get(name, ())),
+                    key=lambda node: node.start_byte,
+                )
+            else:
+                if candidate_key not in candidate_cache:
+                    candidate_cache[candidate_key] = (node_index.find(candidate_types)
+                                                      if node_index is not None else
+                                                      list(find_nodes_by_type(root_node, candidate_types)))
+                candidate_nodes = candidate_cache[candidate_key]
             # Collect all matches for this rule in the file
             matched_nodes: List[Tuple[Node, Dict[str, str]]] = []
             for node in candidate_nodes:
-                matched, bindings = self._check_node_matches_rule(node, rule, source_bytes, file_text)
+                matching_patterns = None
+                if literal_patterns:
+                    callee = node.child_by_field_name('function')
+                    name = get_node_text(callee, source_bytes).strip('\\').lower()
+                    matching_patterns = literal_patterns[name]
+                matched, bindings = self._check_node_matches_rule(
+                    node, rule, source_bytes, matching_patterns)
                 if matched:
+                    if file_flow is not None and not file_flow._runtime_branch_reachable(node):
+                        continue
+                    if (file_flow is not None and node.type == "function_call_expression"
+                            and rule.id in {"php-insecure-unserialize-direct",
+                                            "php-unserialize-without-allowed-classes",
+                                            "php-unserialize-allows-all-classes",
+                                            "php-unserialize-review",
+                                            "php-unserialize-cookie-session"}
+                            and file_flow.call_name(node) == "unserialize"
+                            and file_flow.unserialize_safe(node)):
+                        continue
                     matched_nodes.append((node, bindings))
 
             # Innermost Subsumption: If an inner child node matched, discard ancestor container matches
@@ -199,6 +254,8 @@ class RuleEngine:
 
                 loc = get_node_location(node, file_path)
                 if source_lines is None:
+                    if file_text is None:
+                        file_text = source_bytes.decode("utf-8", errors="replace")
                     source_lines = file_text.splitlines()
                 snippet = get_code_snippet(source_bytes, loc.start_line, loc.end_line, lines=source_lines)
                 
@@ -231,12 +288,13 @@ class RuleEngine:
         node: Node,
         rule: Rule,
         source_bytes: bytes,
-        file_text: str
+        candidate_patterns=None,
     ) -> Tuple[bool, Dict[str, str]]:
         # Reject unrelated nodes before walking or rendering their ancestors.
         all_bindings: Dict[str, str] = {}
         matched = False
-        patterns = [rule.pattern] if rule.pattern else rule.pattern_either
+        patterns = candidate_patterns if candidate_patterns is not None else (
+            [rule.pattern] if rule.pattern else rule.pattern_either)
         for pattern in patterns:
             matched, bindings = self.matcher.matches_ast_node(pattern, node, source_bytes)
             if matched:

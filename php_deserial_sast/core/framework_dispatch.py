@@ -16,6 +16,10 @@ LARAVEL_ENCRYPTER = "Illuminate\\Encryption\\Encrypter"
 LARAVEL_COOKIE = "Illuminate\\Cookie\\Middleware\\EncryptCookies"
 LARAVEL_CSRF = "Illuminate\\Foundation\\Http\\Middleware\\VerifyCsrfToken"
 PREFIX = "Framework dispatch model: "
+LARAVEL_DEFAULT_SERIALIZATION_NOTE = (
+    "Laravel cookie serialization defaults to false in the scanned class; "
+    "a subclass or runtime override may re-enable it."
+)
 
 
 def _field_candidates(symbols):
@@ -65,6 +69,59 @@ def _decrypt_disables_unserialize(engine, call):
         else:
             positional.append(value)
     return len(positional) >= 2 and _proven_false(engine, positional[1], call)
+
+
+def _default_false_return(engine, value, depth=0):
+    """Recognize a constant false default returned through resolved static helpers."""
+    if value is None or depth > 3 or value.type != "scoped_call_expression":
+        return False
+    target = engine.project.resolve(engine, value)
+    if target is None or not target.class_name:
+        return False
+    body = target.node.child_by_field_name("body")
+    statements = [n for n in body.named_children if n.type != "comment"] if body else []
+    if len(statements) != 1 or statements[0].type != "return_statement" or len(statements[0].named_children) != 1:
+        return False
+    result = statements[0].named_children[0]
+    if result.type == "scoped_call_expression":
+        return _default_false_return(target.engine, result, depth + 1)
+    if result.type != "scoped_property_access_expression":
+        return False
+    if target.engine.text(result.child_by_field_name("scope")).lower() not in {"self", "static"}:
+        return False
+    name = target.engine.text(result.child_by_field_name("name")).lstrip("$")
+    owner = engine.project.symbols.get_class(target.class_name) if engine.project.symbols else None
+    prop = owner.properties.get(name) if owner else None
+    if not prop or not prop.default_value or prop.default_value.lower() != "false":
+        return False
+    # A known subclass can replace the late-bound static method or property.
+    owner_name = (owner.full_name or owner.name).lower()
+    for cls in engine.project.symbols.get_all_unique_classes():
+        if cls is owner:
+            continue
+        bases = engine.project.symbols.resolve_inheritance(cls.full_name or cls.name)[1:]
+        if not any((base.full_name or base.name).lower() == owner_name for base in bases):
+            continue
+        override = cls.properties.get(name)
+        if override and (override.default_value or "").lower() != "false":
+            return False
+        if target.name.lower() in cls.methods:
+            return False
+    return True
+
+
+def _decrypt_uses_default_false(engine, call):
+    arguments = call.child_by_field_name("arguments")
+    args = [child for child in arguments.named_children if child.type == "argument"] if arguments else []
+    positional = []
+    for arg in args:
+        name = arg.child_by_field_name("name")
+        value = arg.named_children[-1] if arg.named_children else None
+        if name is not None and engine.text(name) == "unserialize":
+            return _default_false_return(engine, value)
+        if name is None:
+            positional.append(value)
+    return len(positional) >= 2 and _default_false_return(engine, positional[1])
 
 
 class FrameworkDispatch:
@@ -117,6 +174,8 @@ class FrameworkDispatch:
             if not _decrypt_disables_unserialize(engine, call):
                 classes = [LARAVEL_ENCRYPTER]
                 reason = "Laravel encryption contract may resolve to Encrypter; verify service binding, APP_KEY and MAC validation."
+                if _decrypt_uses_default_false(engine, call):
+                    reason += " " + LARAVEL_DEFAULT_SERIALIZATION_NOTE
         for cls in classes:
             result.extend(self.project.method_candidates(cls, name))
         unique = {function.key: function for function in result}
@@ -140,8 +199,10 @@ class FrameworkDispatch:
             if any("validMac(" in method.engine.text(method.node)
                    and "validPayload(" in method.engine.text(method.node)
                    and "throw " in method.engine.text(method.node) for method in methods):
-                return ("Laravel getJsonPayload checks payload structure and MAC before decryption; APP_KEY and successful validation are unverified.",)
-            return ()
+                reviews = ("Laravel getJsonPayload checks payload structure and MAC before decryption; APP_KEY and successful validation are unverified.",)
+            else:
+                reviews = ()
+            return reviews + ((LARAVEL_DEFAULT_SERIALIZATION_NOTE,) if LARAVEL_DEFAULT_SERIALIZATION_NOTE in reason else ())
         scope = engine.scope.get(call.id, -1)
         return tuple("Framework validation requires review: " + engine.text(node)
                      for node in engine.nodes.get(scope, ())

@@ -262,6 +262,7 @@ classDiagram
     analysis
     summary
     findings[]
+    routes[]
     sink_inventory[]
     gadget_chains[]
     errors[]
@@ -280,6 +281,14 @@ classDiagram
     uncertain / review_conditions
     path_assumptions / trace[]
   }
+  class RouteEvidence {
+    route_id / route_kind / status
+    source_finding_id / source_kind
+    sink / impact? / store? / trigger?
+    entry_class? / class_loading?
+    review_conditions[] / missing_edges[]
+    runtime_verified
+  }
   class EvidenceAssessment {
     potential_impact
     evidence_level / detection_level
@@ -295,8 +304,10 @@ classDiagram
   FlowProject --> Finding : cung cấp luồng
   CallGraph --> Finding : cung cấp ứng viên POP
   ScanResult "1" *-- "0..*" Finding
+  ScanResult "1" *-- "0..*" RouteEvidence
   ScanResult "1" *-- "0..*" ScanError
   Finding "1" *-- "0..*" FlowEvidence
+  RouteEvidence --> Finding : source_finding_id
   Finding "1" *-- "0..1" EvidenceAssessment
 ```
 
@@ -318,6 +329,8 @@ classDiagram
 | `Finding.assessment` | Cách diễn giải chứng cứ | Tách impact, evidence, detection level, completeness và limitation |
 | `Finding.metadata` | Bằng chứng chuyên biệt theo engine | Schema mở; consumer không nên giả định mọi finding đều có cùng khóa |
 | `Finding.llm_verification` | Verdict bổ sung từ LLM | Có thể vắng mặt; không làm thay đổi kết quả phân tích tĩnh |
+
+**Bổ sung dữ liệu route sau nâng cấp 29/10/2026.** `ScanResult.routes[]` chứa các `RouteEvidence` gắn với `Finding` nguồn qua `source_finding_id`. `route_kind` phân biệt `source_to_sink`, `candidate_gadget` và `candidate_session_dispatch`; `status` là `proven`, `conditional` hoặc `unknown` cho đúng cạnh tĩnh đang mô tả. `missing_edges[]` ghi điều kiện chưa chứng minh. Route qua session có `store`, `trigger`, `session_key`, `bootstrap_entrypoints` và `class_loading`; route đọc DB có thể ghi `persistent_table` và `persistent_column`. `route_id` là hash của danh tính ngữ nghĩa đã chuẩn hóa trong lần quét. `runtime_verified` luôn `False` trong quét tĩnh. `analysis.route_evidence` thống kê số route được giữ và các nhóm bị cắt bớt; `flow_evidence` vẫn là dữ liệu chi tiết của từng finding.
 
 ### 5.4. Quy tắc định danh, quan hệ và vòng đời
 

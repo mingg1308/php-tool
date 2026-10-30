@@ -1,0 +1,36 @@
+rules:
+  - id: php-yaml-object-decoding-enabled-review
+    message: "yaml.decode_php is enabled; PECL YAML can unserialize !php/object tags when parsing YAML. Review every parser input and runtime configuration"
+    severity: LOW
+    confidence: MEDIUM
+    cwe: null
+    owasp: null
+    remediation: "Keep yaml.decode_php disabled unless object restoration is essential and inputs are integrity-protected."
+    pattern-either:
+      - pattern: "ini_set('yaml.decode_php', 1)"
+      - pattern: "ini_set('yaml.decode_php', true)"
+      - pattern: "ini_set('yaml.decode_php', '1')"
+      - pattern: "ini_set('yaml.decode_php', 'On')"
+    metadata:
+      analysis_kind: runtime_configuration_review
+      documentation: "https://www.php.net/manual/en/yaml.configuration.php"
+
+  - id: php-yaml-parse-direct-request-review
+    message: "Request data is parsed as PECL YAML. Object injection requires yaml.decode_php enabled, a !php/object tag, and available gadget classes"
+    severity: MEDIUM
+    confidence: LOW
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    remediation: "Keep yaml.decode_php disabled and do not parse untrusted YAML with PHP object decoding enabled."
+    pattern-either:
+      - pattern: "yaml_parse($_GET[...], ...)"
+      - pattern: "yaml_parse($_POST[...], ...)"
+      - pattern: "yaml_parse($_COOKIE[...], ...)"
+      - pattern: "yaml_parse($_REQUEST[...], ...)"
+      - pattern: "yaml_parse_file($_GET[...], ...)"
+      - pattern: "yaml_parse_file($_POST[...], ...)"
+      - pattern: "yaml_parse_url($_GET[...], ...)"
+      - pattern: "yaml_parse_url($_POST[...], ...)"
+    metadata:
+      analysis_kind: conditional_yaml_object_review
+      runtime_prerequisites: "PECL YAML installed; yaml.decode_php=1; input contains !php/object"
+      documentation: "https://www.php.net/manual/en/function.yaml-parse.php"

@@ -106,13 +106,16 @@ def _reachable_sinks(graph, owner, method, max_depth=4, max_expansions=128):
     seen = {start}
     sinks = []
     expansions = 0
+    truncated = False
     while pending and expansions < max_expansions and len(sinks) < 8:
         node, depth = pending.popleft()
         if depth >= max_depth:
+            truncated |= bool(graph.get_successors(node))
             continue
         for successor, edge in sorted(graph.get_successors(node), key=lambda item: item[0]):
             expansions += 1
             if expansions > max_expansions:
+                truncated = True
                 break
             if successor.startswith('SINK::'):
                 category = edge.call_info.sink_category
@@ -120,11 +123,15 @@ def _reachable_sinks(graph, owner, method, max_depth=4, max_expansions=128):
                     candidate = {'function': edge.call_info.callee_name, 'category': category,
                                  'location': edge.call_info.location.model_dump() if edge.call_info.location else None}
                     if candidate not in sinks:
+                        if len(sinks) >= 8:
+                            truncated = True
+                            break
                         sinks.append(candidate)
             elif successor not in seen:
                 seen.add(successor)
                 pending.append((successor, depth + 1))
-    return sinks
+    truncated |= bool(pending)
+    return sinks, truncated
 
 
 def annotate_session_dispatch(findings, project, graph):
@@ -138,6 +145,8 @@ def annotate_session_dispatch(findings, project, graph):
         return
     stores_by_finding = {}
     keys = set()
+    render_methods = None
+    stringable_count = 0
     for finding in observed:
         engine = project.files.get(finding.location.file_path)
         if engine is None:
@@ -223,13 +232,15 @@ def annotate_session_dispatch(findings, project, graph):
                             continue
                         owner, method = resolved
                         parent = project.symbols.get_class(cls.resolved_parent or cls.parent_class) if (cls.resolved_parent or cls.parent_class) else None
+                        sinks, sink_search_truncated = _reachable_sinks(graph, owner, method)
                         compatible.append({
                             'class': cls.full_name or cls.name,
                             'method_owner': owner.full_name or owner.name,
                             'parent': cls.resolved_parent or cls.parent_class,
                             'overrides_parent_method': bool(parent and owner is cls
                                                             and _method_owner(project.symbols, parent, method_name)),
-                            'dangerous_sinks': _reachable_sinks(graph, owner, method),
+                            'dangerous_sinks': sinks,
+                            'sink_search_truncated': sink_search_truncated,
                         })
                     candidate_cache[method_name] = (compatible, count)
                 compatible, count = candidate_cache[method_name]
@@ -255,7 +266,8 @@ def annotate_session_dispatch(findings, project, graph):
                 rows.append({
                     'session_key': key, 'store_location': store_location.model_dump(),
                     'call_location': call_location.model_dump(), 'method': method_name,
-                    'candidate_classes': available, 'candidate_class_count': count - len(excluded),
+                    'candidate_classes': available, 'candidate_class_count': len(available),
+                    'candidate_classes_unexamined': count - len(compatible),
                     'candidate_classes_truncated': count > len(compatible),
                     'excluded_candidates': excluded[:24],
                     'excluded_candidates_truncated': len(excluded) > 24,
@@ -266,39 +278,43 @@ def annotate_session_dispatch(findings, project, graph):
         renders = []
         for key, store_location in stores[:16]:
             for location in list(renders_by_key.get(key, {}).values())[:16]:
+                if render_methods is None:
+                    render_methods = []
+                    for cls in classes:
+                        resolved = _method_owner(project.symbols, cls, '__toString')
+                        if not resolved:
+                            continue
+                        stringable_count += 1
+                        owner, method = resolved
+                        sinks, sink_search_truncated = _reachable_sinks(graph, owner, method)
+                        if sinks or sink_search_truncated:
+                            render_methods.append((cls, owner, sinks, sink_search_truncated))
                 candidates = []
                 excluded_candidates = []
                 entrypoints = set()
-                count = 0
                 dangerous_count = 0
-                for cls in classes:
-                    resolved = _method_owner(project.symbols, cls, '__toString')
-                    if not resolved:
+                for cls, owner, sinks, sink_search_truncated in render_methods:
+                    loading_key = (finding.location.file_path, location.file_path, cls.file_path)
+                    if loading_key not in loading_cache:
+                        loading_cache[loading_key] = class_loading_status(
+                            project, finding.location.file_path, location.file_path, cls.file_path)
+                    loading, roots = loading_cache[loading_key]
+                    entrypoints.update(roots)
+                    if loading == 'excluded':
+                        excluded_candidates.append({
+                            'class': cls.full_name or cls.name,
+                            'class_file': cls.file_path,
+                            'reason': 'excluded_by_observed_entrypoint_glob_guard',
+                        })
                         continue
-                    count += 1
-                    owner, method = resolved
-                    sinks = _reachable_sinks(graph, owner, method)
-                    if sinks:
-                        loading_key = (finding.location.file_path, location.file_path, cls.file_path)
-                        if loading_key not in loading_cache:
-                            loading_cache[loading_key] = class_loading_status(
-                                project, finding.location.file_path, location.file_path, cls.file_path)
-                        loading, roots = loading_cache[loading_key]
-                        entrypoints.update(roots)
-                        if loading == 'excluded':
-                            excluded_candidates.append({
-                                'class': cls.full_name or cls.name,
-                                'class_file': cls.file_path,
-                                'reason': 'excluded_by_observed_entrypoint_glob_guard',
-                            })
-                            continue
-                        dangerous_count += 1
-                        if len(candidates) < 24:
-                            candidates.append({'class': cls.full_name or cls.name,
-                                               'method_owner': owner.full_name or owner.name,
-                                               'class_file': cls.file_path,
-                                               'class_loading': loading,
-                                               'dangerous_sinks': sinks})
+                    dangerous_count += 1
+                    if len(candidates) < 24:
+                        candidates.append({'class': cls.full_name or cls.name,
+                                           'method_owner': owner.full_name or owner.name,
+                                           'class_file': cls.file_path,
+                                           'class_loading': loading,
+                                           'dangerous_sinks': sinks,
+                                           'sink_search_truncated': sink_search_truncated})
                 renders.append({'session_key': key, 'store_location': store_location.model_dump(),
                                 'render_location': location.model_dump(),
                                 'candidate_classes': candidates,
@@ -308,7 +324,7 @@ def annotate_session_dispatch(findings, project, graph):
                                 'excluded_candidates_truncated': len(excluded_candidates) > 24,
                                 'bootstrap_entrypoints': sorted(entrypoints),
                                 'session_bootstrap': bootstrap(finding.location.file_path, location.file_path),
-                                'stringable_class_count': count,
+                                'stringable_class_count': stringable_count,
                                 'cross_request_execution_unverified': True})
         if not rows and not renders:
             continue
@@ -318,3 +334,7 @@ def annotate_session_dispatch(findings, project, graph):
             'class_selection_unverified': True, 'runtime_class_loading_unverified': True,
             'exploitability_verified': False,
         }
+        if any(candidate.get('sink_search_truncated')
+               for row in rows + renders
+               for candidate in row['candidate_classes']):
+            finding.metadata['session_dispatch_search_truncated'] = True

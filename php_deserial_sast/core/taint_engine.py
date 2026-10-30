@@ -3,6 +3,7 @@
 import hashlib
 from php_deserial_sast.core.dataflow import FlowProject, PATH_ARGUMENTS, DESERIALIZATION_FUNCTIONS, arguments, expression, FieldKind
 from php_deserial_sast.core.parser import get_node_location
+from php_deserial_sast.core.framework_dispatch import LARAVEL_DEFAULT_SERIALIZATION_NOTE
 from php_deserial_sast.models import Finding, VulnerabilityType, Severity, Confidence, SinkInventoryEntry, FlowEvidence
 
 PHAR_RUNTIME_NOTE = (
@@ -82,7 +83,8 @@ class TaintEngine:
                  library_mode=False, project=None, php_version=None):
         self.file_path = file_path
         self.project = project or FlowProject(
-            {file_path: (root_node, source_bytes)}, symbol_table, library_mode
+            {file_path: (root_node, source_bytes)}, symbol_table, library_mode,
+            php_version=php_version
         )
         self.owns_project = project is None
         self.php_version = php_version
@@ -99,12 +101,16 @@ class TaintEngine:
         engine = self.project.files[self.file_path]
         candidates = []
         implicit_phar = self.php_version is None or tuple(map(int, self.php_version.split('.')[:2])) < (8, 0)
+        wddx_available = self.php_version is None or tuple(map(int, self.php_version.split('.')[:2])) < (7, 4)
+        checked_call_names = PATH_ARGUMENTS.keys() | DESERIALIZATION_FUNCTIONS
         for scope, nodes in engine.nodes.items():
             candidates.extend(engine.direct_sinks(scope, False))
             candidates.extend(engine.forwarded_sinks(scope, False))
             for node in nodes:
-                if node.type == "function_call_expression" and engine.call_name(node) in set(PATH_ARGUMENTS) | DESERIALIZATION_FUNCTIONS:
+                if node.type == "function_call_expression" and engine.call_name(node) in checked_call_names:
                     self.checked_sites.add((self.file_path, node.start_point[0] + 1, node.start_point[1] + 1))
+        if not wddx_available:
+            candidates = [sink for sink in candidates if sink.name != "wddx_deserialize"]
         self.sink_inventory = self._build_sink_inventory(engine, candidates, implicit_phar)
         groups = {}
         for sink in candidates:
@@ -163,10 +169,18 @@ class TaintEngine:
             if sink.path_assumptions:
                 severity, confidence = Severity.MEDIUM, Confidence.LOW
                 description += "Project constant definitions give a local path prefix; a Phar route would require a different runtime constant configuration. Verify bootstrap order and external overrides. "
+            default_disabled = bool(routes) and all(
+                LARAVEL_DEFAULT_SERIALIZATION_NOTE in route.review_conditions for route in routes)
+            if default_disabled:
+                severity, confidence = Severity.MEDIUM, Confidence.LOW
+                description += "The scanned middleware disables cookie deserialization by default; a runtime override remains possible. "
             if phar:
                 description += PHAR_RUNTIME_NOTE
             else:
                 description += "Object injection additionally requires object reconstruction and available gadget classes."
+            if sink.name == "wddx_deserialize" and self.php_version is None:
+                severity, confidence = Severity.MEDIUM, Confidence.LOW
+                description += " WDDX was removed in PHP 7.4; the target PHP version and extension availability are unknown."
             digest = hashlib.sha256(repr(key).encode()).hexdigest()[:12]
             trace = []
             for step in flow.steps:
@@ -174,7 +188,7 @@ class TaintEngine:
                     trace.append(step)
             findings.append(Finding(
                 id=f"FLOW-{digest}",
-                rule_id="php-library-api-exposure" if assumed else "php-phar-insecure-deserialization" if phar else "php-igbinary-unserialize-tainted-input" if sink.name == "igbinary_unserialize" else "php-unserialize-tainted-input",
+                rule_id="php-library-api-exposure" if assumed else "php-phar-insecure-deserialization" if phar else "php-igbinary-unserialize-tainted-input" if sink.name == "igbinary_unserialize" else "php-wddx-deserialize-tainted-input" if sink.name == "wddx_deserialize" else "php-unserialize-tainted-input",
                 vuln_type=kind, title=title, description=description,
                 severity=severity, confidence=confidence,
                 location=sink.location, code_snippet=sink.code, dataflow_trace=trace,
@@ -196,7 +210,7 @@ class TaintEngine:
                     "engine": "taint", "source_assumption": "library_public_api_parameter" if assumed else "persistent_store_read_unverified" if persistent else "modeled_framework_request" if modeled else "observed_request",
                     "analysis_kind": "source_to_sink_candidate",
                     "methodology_reference": "S5135" if not phar else None,
-                    "analysis_status": "configured_local_path_review" if sink.path_assumptions else "conditional_api_exposure" if assumed else "conditional_persistent_data_flow" if persistent else "guarded_flow_review" if guarded else "unresolved_return_flow" if flow.uncertain else "modeled_source_to_sink" if modeled else "source_to_sink",
+                    "analysis_status": "default_serialization_disabled_review" if default_disabled else "configured_local_path_review" if sink.path_assumptions else "conditional_api_exposure" if assumed else "conditional_persistent_data_flow" if persistent else "conditional_runtime_sink" if sink.name == "wddx_deserialize" and self.php_version is None else "guarded_flow_review" if guarded else "unresolved_return_flow" if flow.uncertain else "modeled_source_to_sink" if modeled else "source_to_sink",
                     "path_prefix_assumptions": list(sink.path_assumptions),
                     "review_conditions": list(sink.review_conditions),
                     "framework_dispatch_assumptions": list(dict.fromkeys(step.description for route in routes for step in route.flow.steps if step.description.startswith("Framework dispatch model:"))),
@@ -219,6 +233,7 @@ class TaintEngine:
                                      (["An attacker can write the same persisted record before this read and the code path is triggered."] if persistent else []) +
                                      (["A reachable Phar archive and a PHP runtime with automatic metadata deserialization."] if phar else []) +
                                      (["The igbinary extension must be installed at runtime."] if sink.name == "igbinary_unserialize" else []) +
+                                     (["PHP must be older than 7.4 and the WDDX extension available."] if sink.name == "wddx_deserialize" else []) +
                                      ["Applicable object classes/gadgets must be loaded; exploitability is not established by taint alone."],
                 },
             ))
@@ -244,6 +259,9 @@ class TaintEngine:
                     continue
                 name = engine.call_name(node)
                 if name not in DESERIALIZATION_FUNCTIONS and name not in PATH_ARGUMENTS:
+                    continue
+                if (name == "wddx_deserialize" and self.php_version is not None
+                        and tuple(map(int, self.php_version.split('.')[:2])) >= (7, 4)):
                     continue
                 if self.project.resolve(engine, node):
                     continue

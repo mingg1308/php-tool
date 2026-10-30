@@ -1,5 +1,6 @@
 """Assess static evidence independently of the potential impact rating."""
 from php_deserial_sast.models import EvidenceAssessment
+from php_deserial_sast.core.review_priority import score_review_priority
 
 
 def compact_flow_evidence(routes, limit=32):
@@ -53,6 +54,8 @@ def assess_finding(finding, errors):
         limitations.add("displayed_flow_evidence_truncated")
     if finding.metadata.get("summary_evidence_truncated"):
         limitations.add("summary_guard_alternatives_truncated")
+    if finding.metadata.get("session_dispatch_search_truncated"):
+        limitations.add("session_dispatch_search_truncated")
     if any(route.uncertain for route in routes):
         limitations.add("unresolved_propagation")
     if any(route.review_conditions for route in routes):
@@ -67,6 +70,8 @@ def assess_finding(finding, errors):
         limitations.add("persistent_store_write_provenance_unverified")
     if finding.metadata.get("sink_type") == "PHAR_DESERIALIZATION" and finding.metadata.get("target_php_version") == "unknown":
         limitations.add("php_runtime_version_unknown")
+    if finding.metadata.get("sink_name") == "wddx_deserialize" and finding.metadata.get("target_php_version") == "unknown":
+        limitations.add("legacy_wddx_runtime_unverified")
     if status == "candidate_call_chain":
         limitations.add("property_control_and_deserialization_entry_not_proven")
     completeness = "limited" if limitations else "within_model"
@@ -84,4 +89,5 @@ def assess_finding(finding, errors):
         potential_impact=finding.severity, evidence_level=level,
         detection_level=detection_level, analysis_completeness=completeness,
         limitations=sorted(limitations),
+        review_priority=score_review_priority(finding, level, detection_level, limitations),
     )

@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from collections import defaultdict, deque
 from typing import Optional
 import re
+import time
 from php_deserial_sast.core.bindings import FieldKind, foreach_bindings
 
 from php_deserial_sast.core.parser import get_node_text, get_node_location, iter_child_nodes, find_nodes_by_type
@@ -22,6 +23,10 @@ from php_deserial_sast.core.object_effects import actual_property, property_owne
 
 SCOPES = {"function_definition", "method_declaration", "anonymous_function", "anonymous_function_creation_expression", "arrow_function"}
 CALLS = {"function_call_expression", "member_call_expression", "nullsafe_member_call_expression", "scoped_call_expression"}
+
+
+class SideEffectBudgetExceeded(RuntimeError):
+    """The optional side-effect solver exceeded its wall-time budget."""
 BRANCHES = {"if_statement", "else_clause", "else_if_clause", "while_statement", "for_statement", "foreach_statement", "do_statement", "case_statement", "default_statement", "catch_clause", "conditional_expression"}
 REQUESTS = {"$_GET", "$_POST", "$_REQUEST", "$_COOKIE", "$_FILES", "$HTTP_RAW_POST_DATA"}
 TRUSTED_SERVER = {"DOCUMENT_ROOT", "SERVER_SOFTWARE", "SERVER_ADDR", "SERVER_PORT", "SCRIPT_FILENAME"}
@@ -31,7 +36,7 @@ SCALAR_FUNCTIONS.update({"is_array", "is_bool", "is_callable", "is_float", "is_i
 TRANSFORMS.update({"fread", "fgets", "stream_get_contents"})
 PATH_ARGUMENTS = {name: (0,) for name in PHAR_TRIGGER_SINKS}
 PATH_ARGUMENTS.update({"hash_file": (1,), "hash_hmac_file": (1,), "copy": (0, 1), "rename": (0, 1), "unlink": (0,), "readfile": (0,), "file": (0,)})
-DESERIALIZATION_FUNCTIONS = {"unserialize", "igbinary_unserialize"}
+DESERIALIZATION_FUNCTIONS = {"unserialize", "igbinary_unserialize", "wddx_deserialize"}
 FIELD_DEPTH_LIMIT = 4
 SUMMARY_GUARD_LIMIT = 16
 
@@ -199,6 +204,7 @@ class FileFlow:
         self.project, self.path, self.root, self.source = project, path, root, source
         self.scope = {}
         self.nodes = defaultdict(list)
+        self._call_nodes = {}
         self.writes = defaultdict(list)
         self.iteration_fields = {}
         self.aliases = defaultdict(list)
@@ -216,6 +222,12 @@ class FileFlow:
         self.context_cache = {}
         self.location_cache = {}
         self.review_condition_cache = {}
+        self._runtime_reachability_cache = {}
+        self._has_php_version_guard = b"PHP_VERSION" in source and b"version_compare" in source.lower()
+        self._shadowed_php_version = self._has_php_version_guard and bool(re.search(
+            rb"\bconst\s+PHP_VERSION\b|\buse\s+const\b[^;]*\bPHP_VERSION\b|\bdefine\s*\([^;]*\bPHP_VERSION\b",
+            source,
+        ))
         self.namespaces = {}
         self.function_imports = {}
         self._index(root, -1, "", "")
@@ -233,7 +245,70 @@ class FileFlow:
 
     def reachable(self, node, scope=None):
         cfg = self.cfgs.get(self.scope.get(node.id, -1) if scope is None else scope)
-        return cfg is None or cfg.is_reachable(node)
+        return (cfg is None or cfg.is_reachable(node)) and self._runtime_branch_reachable(node)
+
+    def _runtime_branch_reachable(self, node):
+        """Prune only PHP_VERSION branches proved impossible for the target runtime."""
+        if not self.project.php_version or not self._has_php_version_guard:
+            return True
+        cached = self._runtime_reachability_cache.get(node.id)
+        if cached is not None:
+            return cached
+        child, parent = node, node.parent
+        while parent is not None and parent.type not in SCOPES:
+            if parent.type == "if_statement":
+                outcome = self._php_version_condition(parent.child_by_field_name("condition"))
+                if outcome is not None:
+                    if child == parent.child_by_field_name("body") and not outcome:
+                        self._runtime_reachability_cache[node.id] = False
+                        return False
+                    if child == parent.child_by_field_name("alternative") and outcome:
+                        self._runtime_reachability_cache[node.id] = False
+                        return False
+            child, parent = parent, parent.parent
+        self._runtime_reachability_cache[node.id] = True
+        return True
+
+    def _php_version_condition(self, node):
+        if self._shadowed_php_version:
+            return None
+        while node is not None and node.type == "parenthesized_expression" and len(node.named_children) == 1:
+            node = node.named_children[0]
+        if node is None or node.type != "function_call_expression" or self.call_name(node) != "version_compare":
+            return None
+        if self.project.resolve(self, node):
+            return None
+        args = arguments(node)
+        if len(args) != 3:
+            return None
+        left, right, operator = (expression(arg) for arg in args)
+        if left is None or right is None or operator is None or self.text(left) != "PHP_VERSION":
+            return None
+        version = literal(right, self.source)
+        comparison = literal(operator, self.source)
+        if not isinstance(version, str) or not re.fullmatch(r"\d+(?:\.\d+){1,2}", version):
+            return None
+        if comparison not in {">=", ">", "<=", "<", "==", "=", "!="}:
+            return None
+        try:
+            target = tuple(map(int, self.project.php_version.split(".")))
+        except ValueError:
+            return None
+        expected = tuple(map(int, version.split(".")))
+        size = max(len(target), len(expected))
+        target += (0,) * (size - len(target))
+        expected += (0,) * (size - len(expected))
+        return {">=": target >= expected, ">": target > expected,
+                "<=": target <= expected, "<": target < expected,
+                "==": target == expected, "=": target == expected,
+                "!=": target != expected}[comparison]
+
+    def calls_in_scope(self, scope):
+        calls = self._call_nodes.get(scope)
+        if calls is None:
+            calls = self._call_nodes[scope] = tuple(
+                node for node in self.nodes[scope] if node.type in CALLS)
+        return calls
 
     def return_value_escapes(self, node):
         """A guaranteed abrupt finally overrides the pending return value."""
@@ -557,6 +632,8 @@ class FileFlow:
         return tuple(replace(f, steps=trace_steps(f.steps + (step,)), **flags) for f in flows)
 
     def read(self, access, use, symbolic=False):
+        if self.project.experimental_side_effects:
+            self.project.check_effect_budget()
         # Augmented assignments recursively read earlier definitions. Share the
         # expression cache lifecycle so summary updates invalidate these reads.
         key = ("read", access, use.id, symbolic)
@@ -614,8 +691,8 @@ class FileFlow:
         cache_key = ("effect_index", scope)
         if cache_key not in self.effect_index:
             indexed = defaultdict(list)
-            for call in self.nodes[scope]:
-                if call.type in CALLS and self.reachable(call, scope):
+            for call in self.calls_in_scope(scope):
+                if self.reachable(call, scope):
                     for target_access, flows, target in self.effect_targets(call, include_hidden_globals=True):
                         indexed[target_access[0]].append((call, target_access, flows, target))
             self.effect_index[cache_key] = indexed
@@ -665,8 +742,8 @@ class FileFlow:
                 flows = self.evaluate(write.child_by_field_name("right"), symbolic=True)
                 key = (index, bounded_fields(access[1:]))
                 effects[key] = merge(effects.get(key, ()), flows)
-            for call in self.nodes[scope]:
-                if call.type not in CALLS or not self.reachable(call, scope):
+            for call in self.calls_in_scope(scope):
+                if not self.reachable(call, scope):
                     continue
                 for access, flows, target in self.effect_targets(call):
                     if access[0] == name:
@@ -677,8 +754,8 @@ class FileFlow:
                                              self.bind(flows, target, call, True))
         # A wrapper can modify a global through a call without declaring a
         # local binding to that global. Preserve that effect for its caller.
-        for call in self.nodes[scope]:
-            if call.type not in CALLS or not self.reachable(call, scope):
+        for call in self.calls_in_scope(scope):
+            if not self.reachable(call, scope):
                 continue
             target = self.project.resolve(self, call)
             if target is None:
@@ -1155,6 +1232,12 @@ class FileFlow:
         return result if preserves else tuple(replace(f, blocked_phar=False) for f in result)
 
     def bind(self, flows, target, call, symbolic, fields=()):
+        if self.project.experimental_side_effects and self.project._effects_building:
+            self.project.effect_bindings += 1
+            if (self.project.max_side_effect_bindings
+                    and self.project.effect_bindings > self.project.max_side_effect_bindings):
+                raise SideEffectBudgetExceeded(
+                    f"Experimental side-effect analysis exceeded {self.project.max_side_effect_bindings} bindings")
         args = arguments(call)
         result = {}
         bound_groups = {}
@@ -1357,7 +1440,7 @@ class FileFlow:
 
     def direct_sinks(self, scope, symbolic):
         sinks = []
-        for call in self.nodes[scope]:
+        for call in self.calls_in_scope(scope):
             if call.type != "function_call_expression" or not self.reachable(call, scope):
                 continue
             name = self.call_name(call)
@@ -1499,22 +1582,29 @@ class FileFlow:
 
     def forwarded_sinks(self, scope, symbolic):
         sinks = []
-        for call in self.nodes[scope]:
-            if call.type not in CALLS or not self.reachable(call, scope):
+        for call in self.calls_in_scope(scope):
+            if not self.reachable(call, scope):
                 continue
+            call_reviews = None
+            validation_reviews = None
+            excludes_objects = None
             for target in self.project.targets(self, call):
                 for sink in self.project.sinks.get(target.key, ()):
                     bound = self.bind((sink.flow,), target, call, symbolic)
                     for flow in self.project.framework_dispatch.annotate(self, call, bound):
                         if sink.name not in DESERIALIZATION_FUNCTIONS and flow.blocked_phar:
                             continue
-                        evidence = (sink.review_conditions + self.review_conditions(call, call)
-                                    + self.project.framework_dispatch.validation_reviews(self, call))
+                        if call_reviews is None:
+                            call_reviews = self.review_conditions(call, call)
+                            validation_reviews = self.project.framework_dispatch.validation_reviews(self, call)
+                        if sink.name == "unserialize" and excludes_objects is None:
+                            excludes_objects = self.object_excluding_guard(call, call)
+                        evidence = sink.review_conditions + call_reviews + validation_reviews
                         sinks.append(replace(
                             sink, flow=flow,
                             review_conditions=tuple(dict.fromkeys(evidence))[:4],
                             object_payload_excluded=(sink.object_payload_excluded or
-                                                     sink.name == "unserialize" and self.object_excluding_guard(call, call)),
+                                                     sink.name == "unserialize" and excludes_objects),
                         ))
         return sinks
 
@@ -1560,7 +1650,7 @@ class FileFlow:
     def discover_validator_guards(self):
         for scope, nodes in self.nodes.items():
             for branch in nodes:
-                if branch.type != 'if_statement' or not self.terminates(branch.child_by_field_name('body'), set()):
+                if branch.type != 'if_statement':
                     continue
                 condition = branch.child_by_field_name('condition')
                 while condition is not None and condition.type == 'parenthesized_expression':
@@ -1572,6 +1662,8 @@ class FileFlow:
                     continue
                 target = self.project.resolve(self, call)
                 if target is None or target.key not in self.project.phar_validators:
+                    continue
+                if not self.terminates(branch.child_by_field_name('body'), set()):
                     continue
                 index = self.project.phar_validators[target.key]
                 args = arguments(call)
@@ -1612,10 +1704,18 @@ class FileFlow:
 
 class FlowProject:
     def __init__(self, parsed_files, symbols=None, library_mode=False, experimental_foreach_cfg=False,
-                 experimental_side_effects=False, experimental_demand_summaries=True, framework_models=True):
+                 experimental_side_effects=False, experimental_demand_summaries=True, framework_models=True,
+                 max_side_effect_seconds=0, php_version=None, max_side_effect_bindings=0):
         self.symbols, self.library_mode = symbols, library_mode
+        self.php_version = php_version
         self.experimental_foreach_cfg = experimental_foreach_cfg
         self.experimental_side_effects = experimental_side_effects
+        self.max_side_effect_seconds = max_side_effect_seconds
+        self.max_side_effect_bindings = max_side_effect_bindings
+        self.effect_bindings = 0
+        self._effects_building = False
+        self._effect_deadline = None
+        self._effect_budget_checks = 0
         self.experimental_demand_summaries = experimental_demand_summaries
         self.return_demands = set()
         self.effect_demands = set()
@@ -1774,20 +1874,34 @@ class FlowProject:
         self.resolutions[cache_key] = result
         return result
 
+    def check_effect_budget(self, force=False):
+        deadline = self._effect_deadline
+        if deadline is None:
+            return
+        self._effect_budget_checks += 1
+        if (force or self._effect_budget_checks % 256 == 0) and time.perf_counter() >= deadline:
+            raise SideEffectBudgetExceeded(
+                f"Experimental side-effect analysis exceeded {self.max_side_effect_seconds:g} seconds")
+
     def build(self, max_rounds=64):
         """Solve callee components before propagating summaries to callers.
 
         Only changed summaries reschedule callers inside a recursive component.
         The budget still bounds recursive growth and reports unfinished work.
         """
+        self._effects_building = self.experimental_side_effects
+        self.effect_bindings = 0
+        self._effect_deadline = (time.perf_counter() + self.max_side_effect_seconds
+                                 if self.experimental_side_effects and self.max_side_effect_seconds
+                                 else None)
+        self._effect_budget_checks = 0
         dependents = defaultdict(set)
         dependencies = {f.key: set() for f in self.functions}
         for f in self.functions:
-            for node in f.engine.nodes[f.node.start_byte]:
-                if node.type in CALLS:
-                    for target in self.targets(f.engine, node):
-                        dependents[target.key].add(f.key)
-                        dependencies[f.key].add(target.key)
+            for node in f.engine.calls_in_scope(f.node.start_byte):
+                for target in self.targets(f.engine, node):
+                    dependents[target.key].add(f.key)
+                    dependencies[f.key].add(target.key)
         functions = {f.key: f for f in self.functions}
         components = summary_components({key: sorted(value) for key, value in dependencies.items()})
         component_ids = {key: index for index, component in enumerate(components) for key in component}
@@ -1800,6 +1914,7 @@ class FlowProject:
         finished = False
         budget = max(10000, len(functions) * max_rounds)
         while self.summary_evaluations < budget:
+            self.check_effect_budget(force=True)
             if not queue and next_component == len(components):
                 if self.library_mode:
                     # Constructor expressions may use helper return summaries
@@ -1876,6 +1991,8 @@ class FlowProject:
             engine.cache.clear()
             engine.effect_index.clear()
             engine.loop_results.clear()
+        self._effects_building = False
+        self._effect_deadline = None
 
     @staticmethod
     def _signature(returns, sinks):

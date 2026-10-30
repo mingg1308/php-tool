@@ -89,3 +89,22 @@ class StructuralMatcherTests(unittest.TestCase):
         findings = engine.evaluate_file('fixture.php', source, root, node_index=ASTIndex(root))
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].metadata['bindings']['$OBJ'], '$obj')
+
+    def test_literal_call_index_preserves_nested_and_qualified_matches(self):
+        from php_deserial_sast.rules.engine import Rule, RuleEngine
+        from php_deserial_sast.core.parser import ASTIndex
+        engine = RuleEngine()
+        engine.rules = [Rule({'id': 'calls', 'pattern-either': [
+            {'pattern': 'unserialize($X)'},
+            {'pattern': 'Vendor\\decode($X)'},
+        ]})]
+        root, source = PHPParser().parse_source(
+            "<?php consume(@unserialize($_GET['x'])); "
+            "Vendor\\decode($_POST['y']); Other\\decode('safe');"
+        )
+        for index in (None, ASTIndex(root)):
+            with self.subTest(indexed=index is not None):
+                findings = engine.evaluate_file('fixture.php', source, root, node_index=index)
+                self.assertEqual(len(findings), 2)
+                self.assertEqual({f.metadata['bindings']['$X'] for f in findings},
+                                 {"$_GET['x']", "$_POST['y']"})

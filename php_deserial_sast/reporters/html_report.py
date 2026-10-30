@@ -324,6 +324,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <p>{{ f.description }}</p>
                 {% if f.assessment %}
                 <p><strong>Static detection:</strong> {{ f.assessment.detection_level }};
+                   {% if f.assessment.review_priority %}
+                   <strong>Review priority:</strong> {{ f.assessment.review_priority.score }}/100
+                   ({{ f.assessment.review_priority.band }}, static triage, not CVSS);
+                   {% endif %}
                    <strong>Exploitability verified:</strong> {{ f.assessment.exploitability_verified }}</p>
                 {% endif %}
 

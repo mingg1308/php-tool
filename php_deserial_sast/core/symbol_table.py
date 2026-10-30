@@ -103,12 +103,17 @@ class ProjectSymbolTable:
 
     def __init__(self):
         self.classes: Dict[str, ClassSymbol] = {}  # Key: full_name and short_name
+        self.class_definitions: Dict[str, List[ClassSymbol]] = {}
         self.functions: Dict[str, FunctionSymbol] = {}
         self.files_scanned: Set[str] = set()
         self.file_use_maps: Dict[str, Dict[str, str]] = {}  # file_path -> {alias: FQCN}
 
     def add_class(self, cls: ClassSymbol):
         canonical_name = cls.full_name or cls.name
+        definitions = self.class_definitions.setdefault(canonical_name.lower(), [])
+        if not any(existing.file_path == cls.file_path and
+                   existing.location == cls.location for existing in definitions):
+            definitions.append(cls)
         existing_canonical = self.classes.get(canonical_name)
         if existing_canonical is not None and existing_canonical.file_path != cls.file_path:
             # A payload-generation test file may redeclare an application's
@@ -126,6 +131,10 @@ class ProjectSymbolTable:
             self.classes[cls.name] = cls
         else:
             self.classes.pop(cls.name, None)
+
+    def get_class_definitions(self, name: str) -> List[ClassSymbol]:
+        """Retain duplicate declarations for entrypoint-sensitive checks."""
+        return list(self.class_definitions.get(name.lower().lstrip('\\'), ()))
 
     def add_function(self, func: FunctionSymbol):
         canonical_name = func.full_name or func.name

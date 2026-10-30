@@ -106,6 +106,11 @@ class ConsoleReporter:
         content_lines.append(f"[bold]Confidence:[/bold] {finding.confidence.value}")
         if finding.assessment:
             content_lines.append(f"[bold]Static detection:[/bold] {finding.assessment.detection_level}")
+            if finding.assessment.review_priority:
+                priority = finding.assessment.review_priority
+                content_lines.append(
+                    f"[bold]Review priority:[/bold] {priority.score}/100 ({priority.band}; static triage, not CVSS)"
+                )
             content_lines.append(f"[bold]Exploitability verified:[/bold] {finding.assessment.exploitability_verified}")
         content_lines.append(f"[bold]Description:[/bold] {finding.description}")
 

@@ -39,3 +39,16 @@ dist/
 /TCPDF.html
 /reports/
 /html/
+
+# Locally downloaded reference analyzers and case-study source trees
+/codeql/
+/codeql-cli-binaries/
+/progpilot/
+/psalm/
+/semgrep/
+/monolog-1.23.0/
+/testcase/
+
+# Temporary document tooling and generated previews
+/tmp/
+/mono*.html

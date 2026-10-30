@@ -24,6 +24,8 @@ class ScannerConfig(BaseModel):
     framework_models: bool = True
     experimental_foreach_cfg: bool = False
     experimental_side_effects: bool = False
+    max_side_effect_seconds: float = Field(default=60.0, ge=0)
+    max_side_effect_bindings: int = Field(default=25000, ge=0)
     experimental_demand_summaries: bool = True  # Legacy field name; demand mode is now the default.
     max_file_bytes: int = Field(default=0, ge=0)
     max_ast_nodes: int = Field(default=0, ge=0)

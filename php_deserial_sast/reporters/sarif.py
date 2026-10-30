@@ -35,6 +35,18 @@ class SarifReporter:
         """Convert ScanResult to SARIF 2.1.0 dictionary."""
         rules_map: Dict[str, Dict[str, Any]] = {}
         sarif_results: List[Dict[str, Any]] = []
+        routes_by_finding: Dict[str, List[Dict[str, Any]]] = {}
+        for route in result.routes:
+            routes_by_finding.setdefault(route.source_finding_id, []).append({
+                "route_id": route.route_id, "route_kind": route.route_kind,
+                "status": route.status, "gadget_chain_id": route.gadget_chain_id,
+                "session_key": route.session_key, "class_loading": route.class_loading,
+                "bootstrap_entrypoints": route.bootstrap_entrypoints,
+                "session_start_on_both_routes": route.session_start_on_both_routes,
+                "persistent_table": route.persistent_table,
+                "persistent_column": route.persistent_column,
+                "missing_edges": route.missing_edges,
+            })
 
         for finding in result.findings:
             # Register rule
@@ -70,6 +82,7 @@ class SarifReporter:
                     "confidence": finding.confidence.value, **finding.metadata,
                     "assessment": finding.assessment.model_dump(mode="json") if finding.assessment else None,
                     "flow_evidence": [route.model_dump(mode="json") for route in finding.flow_evidence],
+                    "routes": routes_by_finding.get(finding.id, []),
                 },
                 "ruleId": finding.rule_id,
                 "level": SEVERITY_TO_SARIF_LEVEL.get(finding.severity, "warning"),

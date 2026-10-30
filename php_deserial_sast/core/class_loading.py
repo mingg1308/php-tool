@@ -1,11 +1,12 @@
 """Narrow, evidence-based class loading for a known PHP entrypoint.
 
-Only a literal include shared by the deserialization and render files anchors
-an entrypoint. A simple glob include may then prove that one local class file
-is skipped by an exact path inequality. Other loading mechanisms stay unknown.
+Literal includes anchor entrypoints; their order and a narrow glob exclusion
+constrain local class availability. A matching Composer PSR-4 declaration plus
+an observed autoloader include is only a candidate, not runtime proof.
 """
 
 import fnmatch
+import json
 import os
 from collections import defaultdict
 
@@ -15,6 +16,14 @@ from php_deserial_sast.core.parser import find_nodes_by_type
 
 INCLUDES = ('include_expression', 'include_once_expression',
             'require_expression', 'require_once_expression')
+CONDITIONAL_CONTAINERS = {
+    'if_statement', 'else_clause', 'switch_statement', 'case_statement',
+    'while_statement', 'do_statement', 'for_statement', 'foreach_statement',
+    'conditional_expression', 'match_expression', 'binary_expression',
+    'try_statement', 'catch_clause', 'finally_clause', 'function_definition',
+    'method_declaration', 'anonymous_function_creation_expression',
+    'anonymous_function', 'arrow_function',
+}
 
 
 def _unwrap(node):
@@ -24,10 +33,47 @@ def _unwrap(node):
 
 
 def _literal_include(engine, node):
-    value = literal(_unwrap(node.named_children[0]), engine.source) if node.named_children else None
-    if not isinstance(value, str) or not value or '://' in value or os.path.isabs(value):
+    value, anchored = _constant_include_path(
+        engine, node.named_children[0]) if node.named_children else (None, False)
+    if (not isinstance(value, str) or not value or '://' in value
+            or (os.path.isabs(value) and not anchored)):
         return None
-    return os.path.normcase(os.path.normpath(os.path.join(os.path.dirname(engine.path), value)))
+    path = value if anchored else os.path.join(os.path.dirname(engine.path), value)
+    return os.path.normcase(os.path.normpath(path))
+
+
+def _constant_include_path(engine, node, depth=0):
+    """Evaluate only fixed PHP include paths; never guess variable values."""
+    node = _unwrap(node)
+    if node is None or depth > 8:
+        return None, False
+    value = literal(node, engine.source)
+    if isinstance(value, str):
+        return value, False
+    if node.type == 'name':
+        magic = engine.text(node).upper()
+        if magic == '__DIR__':
+            return os.path.dirname(engine.path), True
+        if magic == '__FILE__':
+            return engine.path, True
+    if node.type == 'binary_expression':
+        operator = node.child_by_field_name('operator')
+        if operator is None or engine.text(operator) != '.':
+            return None, False
+        left = node.child_by_field_name('left')
+        right = node.child_by_field_name('right')
+        first, first_anchored = _constant_include_path(engine, left, depth + 1)
+        second, second_anchored = _constant_include_path(engine, right, depth + 1)
+        if first is not None and second is not None:
+            return first + second, first_anchored or second_anchored
+    if (node.type == 'function_call_expression' and engine.call_name(node) == 'dirname'
+            and not engine.project.resolve(engine, node)):
+        args = node.child_by_field_name('arguments')
+        if args is not None and len(args.named_children) == 1:
+            value, anchored = _constant_include_path(engine, args.named_children[0], depth + 1)
+            if anchored and value is not None:
+                return os.path.dirname(value), True
+    return None, False
 
 
 def _common_entrypoints(project, sink_file, render_file):
@@ -54,7 +100,36 @@ def _entrypoint_index(project):
 
 def _entrypoints_for(project, file_path):
     target = os.path.normcase(os.path.normpath(file_path))
-    return _entrypoint_index(project).get(target, ())
+    parents = _entrypoint_index(project).get(target, ())
+    if parents:
+        return parents
+    # A PHP file that starts its own session can be the writer endpoint itself.
+    # This establishes a candidate route, not web exposure or request order.
+    cache = getattr(project, '_class_loading_self_entrypoints', None)
+    if cache is None:
+        cache = {}
+        project._class_loading_self_entrypoints = cache
+    if target not in cache:
+        engine = project.files.get(file_path)
+        cache[target] = (engine,) if engine and _starts_session(project, engine) else ()
+    return cache[target]
+
+
+def _starts_session(project, engine):
+    """Recognize a top-level builtin session_start, excluding dormant methods."""
+    for call in find_nodes_by_type(engine.root, 'function_call_expression'):
+        if engine.call_name(call) != 'session_start' or project.resolve(engine, call):
+            continue
+        ancestor = call.parent
+        while ancestor is not None and ancestor != engine.root:
+            if ancestor.type in {'function_definition', 'method_declaration',
+                                 'anonymous_function_creation_expression',
+                                 'anonymous_function', 'arrow_function'}:
+                break
+            ancestor = ancestor.parent
+        else:
+            return True
+    return False
 
 
 def session_bootstrap_evidence(project, sink_file, render_file):
@@ -66,12 +141,8 @@ def session_bootstrap_evidence(project, sink_file, render_file):
         pairs = [(writer, reader)
                  for writer in _entrypoints_for(project, sink_file)
                  for reader in _entrypoints_for(project, render_file)]
-    def starts_session(engine):
-        return any(engine.call_name(node) == 'session_start'
-                   and not project.resolve(engine, node)
-                   for node in find_nodes_by_type(engine.root, 'function_call_expression'))
     observed = [(writer.path, reader.path) for writer, reader in pairs
-                if starts_session(writer) and starts_session(reader)]
+                if _starts_session(project, writer) and _starts_session(project, reader)]
     return {'session_start_on_both_routes': bool(observed),
             'entrypoint_pairs': [list(pair) for pair in observed[:16]],
             'session_identity_and_request_order_verified': False}
@@ -111,17 +182,28 @@ def _guard_status(engine, include, loop, binding, relative):
     return 'included' if current == loop else 'unknown'
 
 
-def _status_in_entrypoint(engine, class_file):
+def _status_in_entrypoint(project, engine, class_file, before_file=None):
     path = os.path.normcase(os.path.normpath(class_file))
     if path == os.path.normcase(os.path.normpath(engine.path)):
         return 'included'
     includes = list(find_nodes_by_type(engine.root, INCLUDES))
-    if path in {_literal_include(engine, node) for node in includes}:
+    cutoff = None
+    if before_file and os.path.normcase(os.path.normpath(before_file)) != os.path.normcase(os.path.normpath(engine.path)):
+        target = os.path.normcase(os.path.normpath(before_file))
+        boundary = [node.start_byte for node in includes
+                    if _literal_include(engine, node) == target]
+        if boundary:
+            cutoff = min(boundary)
+    direct = [node for node in includes if _literal_include(engine, node) == path]
+    if any(_unconditional_at_top_level(engine, node)
+           and (cutoff is None or node.start_byte < cutoff) for node in direct):
         return 'included'
     relative = os.path.relpath(class_file, os.path.dirname(engine.path)).replace('\\', '/')
     statuses = []
     recognized = set()
     for loop in find_nodes_by_type(engine.root, 'foreach_statement'):
+        if cutoff is not None and loop.start_byte >= cutoff:
+            continue
         parts = [node for node in loop.named_children if node.type != 'comment']
         if len(parts) < 3 or parts[0].type != 'function_call_expression':
             continue
@@ -147,16 +229,97 @@ def _status_in_entrypoint(engine, class_file):
         return 'unknown'
     if 'included' in statuses:
         return 'included'
+    if _composer_autoload_candidate(project, engine, class_file, includes, cutoff):
+        return 'composer_autoload_candidate'
+    if direct:
+        return 'unknown'
     if statuses and all(status == 'excluded' for status in statuses):
         return 'excluded'
     return 'unknown'
+
+
+def _unconditional_at_top_level(engine, node):
+    ancestor = node.parent
+    while ancestor is not None and ancestor != engine.root:
+        if ancestor.type in CONDITIONAL_CONTAINERS:
+            return False
+        ancestor = ancestor.parent
+    return ancestor == engine.root
+
+
+def _composer_autoload_files(project):
+    """Match declared PSR-4 paths; this is configuration, not runtime proof."""
+    cached = getattr(project, '_class_loading_composer_files', None)
+    if cached is not None:
+        return cached
+    matched = set()
+    project._class_loading_composer_files = matched
+    if not project.files or project.symbols is None:
+        return matched
+    root = os.path.commonpath([os.path.abspath(path) for path in project.files])
+    if not os.path.isdir(root):
+        root = os.path.dirname(root)
+    composer_path = os.path.join(root, 'composer.json')
+    autoload_path = os.path.join(root, 'vendor', 'autoload.php')
+    if not os.path.isfile(composer_path) or not os.path.isfile(autoload_path):
+        return matched
+    try:
+        with open(composer_path, encoding='utf-8') as stream:
+            config = json.load(stream)
+        if not isinstance(config, dict) or not isinstance(config.get('autoload'), dict):
+            return matched
+        mappings = config['autoload'].get('psr-4', {})
+        if not isinstance(mappings, dict):
+            return matched
+        for cls in project.symbols.get_all_unique_classes():
+            name = (cls.full_name or cls.name).lstrip('\\')
+            actual = os.path.normcase(os.path.abspath(cls.file_path))
+            for prefix, directories in mappings.items():
+                if (not isinstance(prefix, str) or prefix and not prefix.endswith('\\')
+                        or not name.startswith(prefix)):
+                    continue
+                suffix = name[len(prefix):].replace('\\', os.sep) + '.php'
+                for directory in ([directories] if isinstance(directories, str) else
+                                  directories if isinstance(directories, list) else ()):
+                    if not isinstance(directory, str):
+                        continue
+                    expected = os.path.normcase(os.path.abspath(os.path.join(root, directory, suffix)))
+                    if expected == actual:
+                        matched.add(actual)
+                        break
+    except (OSError, ValueError, TypeError):
+        return matched
+    return matched
+
+
+def _composer_autoload_candidate(project, engine, class_file, includes, cutoff):
+    if os.path.normcase(os.path.abspath(class_file)) not in _composer_autoload_files(project):
+        return False
+    root = os.path.commonpath([os.path.abspath(path) for path in project.files])
+    if not os.path.isdir(root):
+        root = os.path.dirname(root)
+    loader = os.path.normcase(os.path.join(root, 'vendor', 'autoload.php'))
+    for node in includes:
+        target = _literal_include(engine, node)
+        if (target and os.path.normcase(os.path.abspath(target)) == loader
+                and _unconditional_at_top_level(engine, node)
+                and (cutoff is None or node.start_byte < cutoff)):
+            return True
+    return False
 
 
 def class_loading_status(project, sink_file, render_file, class_file):
     """Return (status, entrypoints) for the observed source/render pair."""
     roots = _common_entrypoints(project, sink_file, render_file)
     if roots:
-        statuses = [_status_in_entrypoint(engine, class_file) for engine in roots]
+        statuses = []
+        for engine in roots:
+            pair = (_status_in_entrypoint(project, engine, class_file, sink_file),
+                    _status_in_entrypoint(project, engine, class_file, render_file))
+            statuses.append('included' if pair == ('included', 'included') else
+                            'composer_autoload_candidate' if all(item in {
+                                'included', 'composer_autoload_candidate'} for item in pair) else
+                            'excluded' if 'excluded' in pair else 'unknown')
         entrypoints = [engine.path for engine in roots]
     else:
         # A restored session object may be written and read by different PHP
@@ -171,12 +334,16 @@ def class_loading_status(project, sink_file, render_file, class_file):
         for writer in writers:
             for reader in readers:
                 entrypoints.update((writer.path, reader.path))
-                pair = (_status_in_entrypoint(writer, class_file),
-                        _status_in_entrypoint(reader, class_file))
+                pair = (_status_in_entrypoint(project, writer, class_file, sink_file),
+                        _status_in_entrypoint(project, reader, class_file, render_file))
                 statuses.append('included' if pair == ('included', 'included') else
+                                'composer_autoload_candidate' if all(item in {
+                                    'included', 'composer_autoload_candidate'} for item in pair) else
                                 'excluded' if 'excluded' in pair else 'unknown')
     if 'included' in statuses:
         status = 'included'
+    elif 'composer_autoload_candidate' in statuses:
+        status = 'composer_autoload_candidate'
     elif all(item == 'excluded' for item in statuses):
         status = 'excluded'
     else:

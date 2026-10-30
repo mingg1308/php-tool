@@ -116,6 +116,14 @@ class FlowEvidence(BaseModel):
     trace: List[TaintStep] = Field(default_factory=list)
 
 
+class ReviewPriority(BaseModel):
+    """Deterministic triage order, not CVSS or exploit probability."""
+    score: int = Field(ge=0, le=100)
+    band: Literal["URGENT", "HIGH", "MEDIUM", "LOW"]
+    factors: Dict[str, int]
+    model_version: str = "review-priority-v1"
+
+
 class EvidenceAssessment(BaseModel):
     potential_impact: Severity
     evidence_level: Literal["syntactic_review", "candidate_call_chain", "assumed_api_flow", "assumed_persistent_flow", "modeled_source_flow", "observed_source_flow", "unresolved_flow"]
@@ -123,6 +131,7 @@ class EvidenceAssessment(BaseModel):
     analysis_completeness: Literal["within_model", "limited"]
     limitations: List[str] = Field(default_factory=list)
     exploitability_verified: bool = False
+    review_priority: Optional[ReviewPriority] = None
 
 
 class Finding(BaseModel):
@@ -156,6 +165,34 @@ class SinkInventoryEntry(BaseModel):
     note: str = ""
 
 
+class RouteEvidence(BaseModel):
+    """A source-to-sink route, optionally linked to a candidate gadget."""
+    route_id: str
+    route_kind: Literal["source_to_sink", "candidate_gadget", "candidate_session_dispatch", "candidate_persistent_store"]
+    status: Literal["proven", "conditional", "unknown"]
+    source_finding_id: str
+    source_kind: str
+    source_origin: str
+    sink: CodeLocation
+    gadget_chain_id: Optional[str] = None
+    entry_class: Optional[str] = None
+    impact: Optional[CodeLocation] = None
+    store: Optional[CodeLocation] = None
+    trigger: Optional[CodeLocation] = None
+    session_key: Optional[str] = None
+    class_loading: Optional[str] = None
+    bootstrap_entrypoints: List[str] = Field(default_factory=list)
+    session_start_on_both_routes: Optional[bool] = None
+    review_conditions: List[str] = Field(default_factory=list)
+    path_assumptions: List[str] = Field(default_factory=list)
+    persistent_table: Optional[str] = None
+    persistent_column: Optional[str] = None
+    missing_edges: List[str] = Field(default_factory=list)
+    # Proven means the specified static source-to-sink edge was modeled;
+    # it never means the runtime exploit was executed.
+    runtime_verified: bool = False
+
+
 class ScanSummary(BaseModel):
     api_exposure_count: int = 0
     total_files_discovered: int = 0
@@ -186,6 +223,7 @@ class ScanResult(BaseModel):
     summary: ScanSummary
     findings: List[Finding]
     sink_inventory: List[SinkInventoryEntry] = Field(default_factory=list)
+    routes: List[RouteEvidence] = Field(default_factory=list)
     gadget_chains: List[GadgetChain] = Field(default_factory=list)
     all_classes: List[str] = Field(default_factory=list)
     errors: List[ScanError] = Field(default_factory=list)

@@ -56,8 +56,6 @@ def annotate_pop_candidates(findings, project):
                 and any(route.source_kind == 'request' and not route.uncertain
                         for route in f.flow_evidence)}
     observed_by_id = {f.id: f for f in observed.values()}
-    class_index = {(cls.full_name or cls.name).lower().lstrip('\\'): cls
-                   for cls in project.symbols.get_all_unique_classes()} if project.symbols else {}
     sites = []
     for engine in project.files.values():
         for scope, nodes in engine.nodes.items():
@@ -96,7 +94,12 @@ def annotate_pop_candidates(findings, project):
         # loading evidence. A public property mentioned at the final sink can
         # be supplied by serialized object data. Neither fact proves that a
         # branch in the magic method is feasible at runtime.
-        cls = class_index.get(entry)
+        definitions = project.symbols.get_class_definitions(entry)
+        entry_method_file = finding.gadget_chain.steps[0].location.file_path
+        cls = next((item for item in definitions
+                    if item.file_path == entry_method_file), None)
+        if cls is None:
+            cls = project.symbols.get_class(finding.gadget_chain.entry_class)
         linked = []
         if cls and finding.gadget_chain.entry_method.lower() in {'__wakeup', '__unserialize'}:
             engine = project.files.get(cls.file_path)

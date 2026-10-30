@@ -46,7 +46,7 @@ def actual_property(engine, target, call, owner):
 
 
 def property_effects(engine, function):
-    from php_deserial_sast.core.dataflow import CALLS, bounded_fields, merge
+    from php_deserial_sast.core.dataflow import bounded_fields, merge
     scope = function.node.start_byte
     cfg = engine.cfgs.get(scope)
     effects = {}
@@ -61,10 +61,12 @@ def property_effects(engine, function):
         effects[key] = merge(effects.get(key, ()), flows)
 
     for write, access in engine.scope_writes.get(scope, ()):
+        engine.project.check_effect_budget()
         if property_owner(engine, function, access, write) is not None:
             add(write, access, engine.evaluate(write.child_by_field_name('right'), symbolic=True))
-    for call in engine.nodes[scope]:
-        if call.type in CALLS and engine.reachable(call, scope):
+    for call in engine.calls_in_scope(scope):
+        engine.project.check_effect_budget()
+        if engine.reachable(call, scope):
             for access, flows, target in engine.effect_targets(call):
                 if property_owner(engine, function, access, call) is not None:
                     add(call, access, engine.bind(flows, target, call, True))

@@ -1,0 +1,28 @@
+rules:
+  - id: php-wddx-deserialize-direct-request-review
+    message: "Request data reaches wddx_deserialize(); this API can reconstruct PHP objects only on PHP versions before 7.4 with WDDX available"
+    severity: MEDIUM
+    confidence: MEDIUM
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    remediation: "Do not decode untrusted WDDX packets into PHP objects. Migrate to a data-only format and verify the deployed PHP version."
+    pattern-either:
+      - pattern: "wddx_deserialize($_GET[...])"
+      - pattern: "wddx_deserialize($_POST[...])"
+      - pattern: "wddx_deserialize($_COOKIE[...])"
+      - pattern: "wddx_deserialize($_REQUEST[...])"
+      - pattern: "wddx_deserialize(file_get_contents('php://input'))"
+    metadata:
+      analysis_kind: conditional_legacy_deserialization_review
+      runtime_prerequisites: "PHP < 7.4, WDDX extension available, object-bearing packet, loaded gadget classes"
+      documentation: "https://www.php.net/manual/en/function.wddx-deserialize.php"
+
+  - id: php-wddx-deserialize-review
+    message: "Review wddx_deserialize(): determine whether the packet is untrusted and the legacy WDDX runtime is active"
+    severity: INFO
+    confidence: LOW
+    cwe: "CWE-502: Deserialization of Untrusted Data"
+    remediation: "Avoid restoring PHP objects from untrusted WDDX data; verify PHP version and extension availability."
+    pattern: "wddx_deserialize($DATA)"
+    metadata:
+      analysis_kind: legacy_deserialization_hotspot
+      documentation: "https://www.php.net/manual/en/function.wddx-deserialize.php"

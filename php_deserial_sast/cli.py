@@ -58,6 +58,8 @@ def main():
 @click.option("--framework-models/--no-framework-models", default=True, help="Use explicit conditional framework dispatch contracts.")
 @click.option("--experimental-foreach-cfg", is_flag=True, help="Opt into experimental foreach CFG; large-project performance is not validated.")
 @click.option("--experimental-side-effects", is_flag=True, help="Enable experimental reference/global effects; may be slow on large projects.")
+@click.option("--max-side-effect-seconds", type=click.FloatRange(min=0), default=60.0, show_default=True, help="Time budget for experimental side effects; 0 disables the budget. On expiry, taint is rescanned without side effects and coverage is marked incomplete.")
+@click.option("--max-side-effect-bindings", type=click.IntRange(min=0), default=25000, show_default=True, help="Binding budget while building experimental side-effect summaries; 0 disables this limit. On expiry, baseline taint is rescanned and coverage is marked incomplete.")
 @click.option("--demand-summaries/--eager-summaries", "experimental_demand_summaries", default=True, show_default=True, help="Compute return and enabled side-effect summaries on demand; eager mode evaluates all summaries for comparison.")
 @click.option("--experimental-demand-summaries", "legacy_demand_summaries", is_flag=True, hidden=True)
 @click.option("--php-version", callback=validate_php_version, help="Target PHP runtime, e.g. 7.4 or 8.3; unknown when omitted.")
@@ -82,6 +84,8 @@ def scan_cmd(
     framework_models,
     experimental_foreach_cfg,
     experimental_side_effects,
+    max_side_effect_seconds,
+    max_side_effect_bindings,
     experimental_demand_summaries,
     legacy_demand_summaries,
     php_version,
@@ -105,6 +109,8 @@ def scan_cmd(
         framework_models=framework_models,
         experimental_foreach_cfg=experimental_foreach_cfg,
         experimental_side_effects=experimental_side_effects,
+        max_side_effect_seconds=max_side_effect_seconds,
+        max_side_effect_bindings=max_side_effect_bindings,
         experimental_demand_summaries=experimental_demand_summaries or legacy_demand_summaries,
         php_version=php_version,
         enable_llm=llm,

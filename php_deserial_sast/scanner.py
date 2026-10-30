@@ -23,8 +23,9 @@ from php_deserial_sast.core.ast_visitor import ASTVisitor
 from php_deserial_sast.core.call_graph import CallGraph
 from php_deserial_sast.core.gadget_finder import GadgetFinder
 from php_deserial_sast.core.taint_engine import TaintEngine, FLOW_EVIDENCE_LIMIT, route_summary
-from php_deserial_sast.core.dataflow import FlowProject
+from php_deserial_sast.core.dataflow import FlowProject, SideEffectBudgetExceeded, arguments, expression
 from php_deserial_sast.core.evidence import assess_finding, compact_flow_evidence
+from php_deserial_sast.core.route_evidence import build_route_evidence
 from php_deserial_sast.core.control_flow import coverage as cfg_coverage
 from php_deserial_sast.core.finding_coverage import FindingCoverage
 from php_deserial_sast.core.pop_evidence import annotate_pop_candidates
@@ -32,6 +33,8 @@ from php_deserial_sast.core.deserialized_dispatch import annotate_session_dispat
 from php_deserial_sast.core.persistent_store import annotate_persistent_store_writes
 from php_deserial_sast.core.finding_scope import source_scope
 from php_deserial_sast.core.phar_metadata_rules import explicit_phar_metadata_reviews
+from php_deserial_sast.core.spl_deserialization_rules import explicit_spl_deserialization_reviews
+from php_deserial_sast.core.serializable_callback_rules import serializable_callback_reviews
 from php_deserial_sast.core.package_context import package_context, annotate_advisories
 from php_deserial_sast.rules.engine import RuleEngine
 from php_deserial_sast.llm.verifier import LLMVerifier
@@ -155,19 +158,45 @@ class PHPDeserializationScanner:
 
         # Phase 2: Build Call Graph & Collect Inter-procedural Taint Summaries
         call_graph = CallGraph(self.symbol_table) if self.config.enable_gadgets else None
+        finder = None
         if call_graph and call_graph.dispatch_candidates_truncated:
             errors.append(ScanError(file_path=self.config.target_path, phase="call_graph_limit",
                                     message=f"Dynamic dispatch candidate caps omitted {call_graph.dispatch_candidates_truncated} candidate edges; POP coverage is incomplete."))
 
         flow_project = None
+        side_effect_fallback = False
+        side_effect_attempted_evaluations = 0
+        side_effect_attempted_effect_demands = 0
+        side_effect_attempted_bindings = 0
         if self.config.enable_taint:
             try:
-                flow_project = FlowProject(parsed_files, self.symbol_table, self.config.library_mode,
-                                           experimental_foreach_cfg=self.config.experimental_foreach_cfg,
-                                           experimental_side_effects=self.config.experimental_side_effects,
-                                           experimental_demand_summaries=self.config.experimental_demand_summaries,
-                                           framework_models=self.config.framework_models)
-                flow_project.build()
+                flow_options = dict(
+                    experimental_foreach_cfg=self.config.experimental_foreach_cfg,
+                    experimental_demand_summaries=self.config.experimental_demand_summaries,
+                    framework_models=self.config.framework_models,
+                    php_version=self.config.php_version,
+                )
+                flow_project = FlowProject(
+                    parsed_files, self.symbol_table, self.config.library_mode,
+                    experimental_side_effects=self.config.experimental_side_effects,
+                    max_side_effect_seconds=self.config.max_side_effect_seconds,
+                    max_side_effect_bindings=self.config.max_side_effect_bindings,
+                    **flow_options,
+                )
+                try:
+                    flow_project.build()
+                except SideEffectBudgetExceeded as exc:
+                    side_effect_fallback = True
+                    side_effect_attempted_evaluations = flow_project.summary_evaluations
+                    side_effect_attempted_effect_demands = len(flow_project.effect_demands)
+                    side_effect_attempted_bindings = flow_project.effect_bindings
+                    errors.append(ScanError(file_path=self.config.target_path, phase="side_effect_budget",
+                                            message=f"{exc}; rescanned taint without experimental side effects. Reference/global/property effect coverage is incomplete."))
+                    flow_project = FlowProject(
+                        parsed_files, self.symbol_table, self.config.library_mode,
+                        experimental_side_effects=False, **flow_options,
+                    )
+                    flow_project.build()
                 if not flow_project.converged:
                     errors.append(ScanError(file_path=self.config.target_path, phase="taint_summary", message="Interprocedural summaries reached their iteration limit; coverage may be incomplete."))
             except Exception as e:
@@ -176,6 +205,9 @@ class PHPDeserializationScanner:
         phase_times["graph_and_summaries"] = time.perf_counter() - phase_start
         phase_start = time.perf_counter()
         all_findings: List[Finding] = streamed_findings
+
+        if self.config.enable_rules:
+            all_findings.extend(serializable_callback_reviews(self.symbol_table))
         gadget_chains: List[GadgetChain] = []
 
         # Phase 3.1: POP Gadget Chain Analysis
@@ -196,6 +228,8 @@ class PHPDeserializationScanner:
             if flow_project and self.config.enable_rules:
                 all_findings.extend(explicit_phar_metadata_reviews(
                     flow_project.files[file_path], self.config.php_version))
+                all_findings.extend(explicit_spl_deserialization_reviews(
+                    flow_project.files[file_path]))
             # Taint Engine
             if self.config.enable_taint:
                 try:
@@ -219,28 +253,81 @@ class PHPDeserializationScanner:
             # Rule Engine
             if self.rule_engine:
                 try:
-                    syntactic = self.rule_engine.evaluate_file(file_path, source_bytes, root_node, node_indexes[file_path])
+                    syntactic = self.rule_engine.evaluate_file(
+                        file_path, source_bytes, root_node, node_indexes[file_path],
+                        flow_project.files[file_path] if flow_project else None)
                     builtin_flow_rules = {"php-phar-filesystem-deserialization", "php-insecure-unserialize-direct", "php-unserialize-without-allowed-classes", "php-unserialize-cookie-session"}
                     syntactic = self._filter_contextual_rule_findings(syntactic)
                     shadowed_igbinary_sites = set()
-                    if flow_project and any(f.rule_id == "php-igbinary-unserialize-review" for f in syntactic):
+                    shadowed_extra_builtin_sites = set()
+                    yaml_disabled_sites = set()
+                    if flow_project and any(f.rule_id == "php-igbinary-unserialize-review"
+                                            or f.rule_id.startswith(("php-wddx-deserialize-", "php-yaml-parse-"))
+                                            for f in syntactic):
                         engine = flow_project.files[file_path]
                         for nodes in engine.nodes.values():
                             for call in nodes:
-                                if (call.type == "function_call_expression"
-                                        and engine.call_name(call) == "igbinary_unserialize"
-                                        and flow_project.resolve(engine, call)):
-                                    shadowed_igbinary_sites.add((call.start_point[0] + 1, call.start_point[1] + 1))
+                                if call.type != "function_call_expression":
+                                    continue
+                                name = engine.call_name(call)
+                                if name not in {"igbinary_unserialize", "wddx_deserialize",
+                                                "yaml_parse", "yaml_parse_file", "yaml_parse_url"}:
+                                    continue
+                                if flow_project.resolve(engine, call):
+                                    site = (call.start_point[0] + 1, call.start_point[1] + 1)
+                                    if name == "igbinary_unserialize":
+                                        shadowed_igbinary_sites.add(site)
+                                    else:
+                                        shadowed_extra_builtin_sites.add(site)
+                    if (flow_project and any(f.rule_id == "php-yaml-parse-direct-request-review"
+                                             for f in syntactic)):
+                        engine = flow_project.files[file_path]
+                        settings, yaml_calls = [], []
+                        for scope, nodes in engine.nodes.items():
+                            for call in nodes:
+                                if call.type != "function_call_expression":
+                                    continue
+                                name = engine.call_name(call)
+                                if name in {"yaml_parse", "yaml_parse_file", "yaml_parse_url"}:
+                                    yaml_calls.append((scope, call))
+                                elif name == "ini_set" and not flow_project.resolve(engine, call):
+                                    args = arguments(call)
+                                    if len(args) < 2:
+                                        continue
+                                    key = engine.text(expression(args[0])).strip("'\"").lower()
+                                    if key == "yaml.decode_php":
+                                        value = engine.text(expression(args[1])).strip("'\"").lower()
+                                        settings.append((scope, call, value))
+                        for scope, call in yaml_calls:
+                            disabled = [setting for setting_scope, setting, value in settings
+                                        if setting_scope == scope and value in {"0", "false", "off"}
+                                        and setting.start_byte < call.start_byte
+                                        and engine.dominates(setting, call)]
+                            if not disabled:
+                                continue
+                            last_disable = max(disabled, key=lambda setting: setting.start_byte)
+                            if not any(setting_scope == scope
+                                       and last_disable.start_byte < setting.start_byte < call.start_byte
+                                       for setting_scope, setting, _ in settings):
+                                yaml_disabled_sites.add((call.start_point[0] + 1,
+                                                         call.start_point[1] + 1))
                     all_findings.extend(f for f in syntactic if not (
                         f.rule_id in builtin_flow_rules and (file_path, f.location.start_line, f.location.start_col) in checked_sites
                     ) and not (
                         f.rule_id == "php-igbinary-unserialize-review"
                         and (f.location.start_line, f.location.start_col) in shadowed_igbinary_sites
+                    ) and not (
+                        f.rule_id.startswith(("php-wddx-deserialize-", "php-yaml-parse-"))
+                        and (f.location.start_line, f.location.start_col) in shadowed_extra_builtin_sites
+                    ) and not (
+                        f.rule_id == "php-yaml-parse-direct-request-review"
+                        and (f.location.start_line, f.location.start_col) in yaml_disabled_sites
                     ))
                 except Exception as e:
                     errors.append(ScanError(file_path=file_path, phase="rules", message=str(e)))
 
         phase_times["findings"] = time.perf_counter() - phase_start
+        phase_start = time.perf_counter()
         # Phase 4: Deduplicate and Filter
         # A caller in another file can establish a route to this lexical sink.
         # Reconcile after all files, independently of the severity filter.
@@ -312,6 +399,9 @@ class PHPDeserializationScanner:
                 finding.metadata["summary_evidence_truncated"] = True
             assess_finding(finding, errors)
 
+        routes = build_route_evidence(filtered_findings)
+        phase_times["postprocess_and_evidence"] = time.perf_counter() - phase_start
+
         # Phase 6: Build Summary & Result
         duration = time.time() - start_time
         summary = self._create_summary(
@@ -332,6 +422,8 @@ class PHPDeserializationScanner:
             item.sink_argument,
         ))
         sink_dispositions = Counter(item.disposition for item in sink_inventory)
+        route_kinds = Counter(route.route_kind for route in routes)
+        route_statuses = Counter(route.status for route in routes)
         excluded_sites = [
             {"file": key[0], "line": key[1], "column": key[2],
              "sink_argument": key[3], "sink_name": key[4],
@@ -354,26 +446,41 @@ class PHPDeserializationScanner:
                       "sink_inventory": {"enabled": self.config.enable_taint,
                                          "total_sinks": len(sink_inventory),
                                          "by_disposition": dict(sorted(sink_dispositions.items()))},
+                      "route_evidence": {
+                          "retained_routes": len(routes),
+                          "by_kind": dict(sorted(route_kinds.items())),
+                          "by_status": dict(sorted(route_statuses.items())),
+                          "findings_with_displayed_flows_truncated": sum(
+                              bool(f.metadata.get("flow_evidence_truncated"))
+                              for f in filtered_findings),
+                          "runtime_verified": False,
+                      },
                       "performance": {"scanned_bytes": scanned_bytes, "largest_file_bytes": largest_file_bytes,
                                       "indexed_ast_nodes": indexed_nodes, "streamed_data_files": streamed_files,
                                       "retained_project_files": len(parsed_files), "phase_seconds": phase_times},
                       "discovery": {"excluded_directories": sorted(self.config.exclude_dirs),
                                     "php_extensions": sorted(PHP_EXTENSIONS),
                                     "directory_errors": sum(error.phase == "discovery" for error in errors)},
-                      "limits": {"max_file_bytes": self.config.max_file_bytes, "max_ast_nodes": self.config.max_ast_nodes, "max_gadget_paths": self.config.max_gadget_paths, "max_gadget_expansions": self.config.max_gadget_expansions},
+                      "limits": {"max_file_bytes": self.config.max_file_bytes, "max_ast_nodes": self.config.max_ast_nodes, "max_gadget_paths": self.config.max_gadget_paths, "max_gadget_expansions": self.config.max_gadget_expansions,
+                                 "max_side_effect_seconds": self.config.max_side_effect_seconds,
+                                 "max_side_effect_bindings": self.config.max_side_effect_bindings},
                       "taint_enabled": self.config.enable_taint, "rules_enabled": self.config.enable_rules,
-                      "gadgets_enabled": self.config.enable_gadgets, "gadget_paths_examined": getattr(locals().get("finder"), "paths_examined", 0),
-                      "gadget_expansions": getattr(locals().get("finder"), "expansions", 0),
-                      "gadget_limit_reached": getattr(locals().get("finder"), "limit_reached", False),
+                      "gadgets_enabled": self.config.enable_gadgets, "gadget_paths_examined": getattr(finder, "paths_examined", 0),
+                      "gadget_expansions": getattr(finder, "expansions", 0),
+                      "gadget_limit_reached": getattr(finder, "limit_reached", False),
                       "call_graph": {"typed_dynamic_calls_resolved": getattr(call_graph, "dynamic_calls_resolved", 0),
                                      "typed_dynamic_calls_unresolved": getattr(call_graph, "dynamic_calls_unresolved", 0),
                                      "dispatch_candidates_truncated": getattr(call_graph, "dispatch_candidates_truncated", 0)},
                       "llm_enabled": self.config.enable_llm,
                       "dataflow": "use-site definitions with separate array fields; statement CFG pruning for supported scopes",
-                      "interprocedural_side_effects": {"enabled": self.config.experimental_side_effects,
-                          "status": "experimental" if self.config.experimental_side_effects else "disabled",
-                          "models": ["reference_parameters", "literal_globals", "receiver_and_parameter_properties"] if self.config.experimental_side_effects else [],
-                          "limitations": ["global_alias_and_heap_not_fully_modeled", "loop_carried_effects_incomplete"] if self.config.experimental_side_effects else ["reference_global_and_object_effects_not_modeled"]},
+                      "interprocedural_side_effects": {"enabled": bool(flow_project and flow_project.experimental_side_effects),
+                          "requested": self.config.experimental_side_effects,
+                          "status": "budget_fallback" if side_effect_fallback else "experimental" if self.config.experimental_side_effects else "disabled",
+                          "attempted_summary_evaluations": side_effect_attempted_evaluations if side_effect_fallback else None,
+                          "attempted_effect_demands": side_effect_attempted_effect_demands if side_effect_fallback else None,
+                          "attempted_bindings": side_effect_attempted_bindings if side_effect_fallback else getattr(flow_project, "effect_bindings", 0),
+                          "models": ["reference_parameters", "literal_globals", "receiver_and_parameter_properties"] if flow_project and flow_project.experimental_side_effects else [],
+                          "limitations": ["global_alias_and_heap_not_fully_modeled", "loop_carried_effects_incomplete"] if flow_project and flow_project.experimental_side_effects else ["reference_global_and_object_effects_not_modeled"]},
                       "control_flow": control_flow,
                       "field_depth_limit": 4, "field_paths_widened": getattr(flow_project, "field_paths_widened", False),
                       "summary_solver": "dependency_worklist",
@@ -389,6 +496,7 @@ class PHPDeserializationScanner:
             summary=summary,
             findings=filtered_findings,
             sink_inventory=sink_inventory,
+            routes=routes,
             gadget_chains=gadget_chains,
             all_classes=all_class_names,
             errors=errors
@@ -433,6 +541,9 @@ class PHPDeserializationScanner:
 
         filtered = []
         for finding in findings:
+            if (finding.rule_id.startswith("php-wddx-deserialize-") and version
+                    and tuple(int(part) for part in version.split(".")) >= (7, 4)):
+                continue
             if finding.rule_id != "php-phar-path-api-review":
                 filtered.append(finding)
                 continue
@@ -464,14 +575,10 @@ class PHPDeserializationScanner:
         3. Multi-rule clustering: For multiple custom rules firing on the exact same token/location,
            keep only the most specific/highest severity finding.
         """
-        norm_findings: List[Finding] = []
-        for f in findings:
-            norm_findings.append(f)
-
         # 1. Collect Taint Engine verified sink locations
         taint_deserial_lines: Set[Tuple[str, int]] = set()
         taint_phar_lines: Set[Tuple[str, int]] = set()
-        for f in norm_findings:
+        for f in findings:
             norm_file = os.path.normpath(f.location.file_path)
             if f.vuln_type == VulnerabilityType.DIRECT_UNSERIALIZE:
                 for ln in range(f.location.start_line, f.location.end_line + 1):
@@ -483,10 +590,11 @@ class PHPDeserializationScanner:
                     taint_phar_lines.add((norm_file, ln))
 
         # 2. Collect POP Gadget Chain spans
-        covered_magic_spans: List[Tuple[str, int, int, str]] = []
+        covered_magic_spans: Dict[str, List[Tuple[int, int]]] = {}
         unrestricted_unserialize_sites: Set[Tuple[str, int]] = set()
         direct_session_decode_sites: Set[Tuple[str, int, int]] = set()
-        for f in norm_findings:
+        direct_wddx_sites: Set[Tuple[str, int, int]] = set()
+        for f in findings:
             if f.rule_id == "php-unserialize-allows-all-classes":
                 unrestricted_unserialize_sites.add((
                     os.path.normcase(os.path.normpath(f.location.file_path)),
@@ -497,20 +605,23 @@ class PHPDeserializationScanner:
                     os.path.normcase(os.path.normpath(f.location.file_path)),
                     f.location.start_line, f.location.start_col,
                 ))
+            if f.rule_id == "php-wddx-deserialize-direct-request-review":
+                direct_wddx_sites.add((
+                    os.path.normcase(os.path.normpath(f.location.file_path)),
+                    f.location.start_line, f.location.start_col,
+                ))
             if f.vuln_type == VulnerabilityType.POP_GADGET_CHAIN and f.gadget_chain:
                 first_step = f.gadget_chain.steps[0] if f.gadget_chain.steps else None
                 if first_step:
                     norm_file = os.path.normpath(first_step.location.file_path)
-                    covered_magic_spans.append((
-                        norm_file,
+                    covered_magic_spans.setdefault(norm_file, []).append((
                         first_step.location.start_line,
                         first_step.location.end_line,
-                        f.gadget_chain.entry_method
                     ))
 
         # 3. Filter redundant findings based on cross-engine correlation
         correlated: List[Finding] = []
-        for f in norm_findings:
+        for f in findings:
             norm_file = os.path.normpath(f.location.file_path)
             start_line = f.location.start_line
 
@@ -520,6 +631,10 @@ class PHPDeserializationScanner:
                 if (rule_id == "php-session-decode-review"
                         and (os.path.normcase(norm_file), start_line, f.location.start_col)
                         in direct_session_decode_sites):
+                    continue
+                if (rule_id == "php-wddx-deserialize-review"
+                        and (os.path.normcase(norm_file), start_line, f.location.start_col)
+                        in direct_wddx_sites):
                     continue
 
                 # An explicit allowed_classes=true match is the more specific
@@ -542,8 +657,8 @@ class PHPDeserializationScanner:
                 # Check if covered by a full POP Gadget Chain
                 if any(m in rule_id for m in ("magic", "wakeup", "destruct", "tostring")):
                     is_subsumed = False
-                    for span_file, span_start, span_end, entry_m in covered_magic_spans:
-                        if span_file == norm_file and span_start <= start_line <= span_end + 3:
+                    for span_start, span_end in covered_magic_spans.get(norm_file, ()):
+                        if span_start <= start_line <= span_end + 3:
                             is_subsumed = True
                             break
                     if is_subsumed:
@@ -646,8 +761,9 @@ class PHPDeserializationScanner:
         low = sum(1 for f in findings if f.severity == Severity.LOW)
         info = sum(1 for f in findings if f.severity == Severity.INFO)
 
-        unique_classes = len(self.symbol_table.get_all_unique_classes())
-        total_methods = sum(len(c.methods) for c in self.symbol_table.get_all_unique_classes())
+        classes = self.symbol_table.get_all_unique_classes()
+        unique_classes = len(classes)
+        total_methods = sum(len(c.methods) for c in classes)
 
         return ScanSummary(
             api_exposure_count=sum(f.vuln_type == VulnerabilityType.LIBRARY_API_EXPOSURE for f in findings),

@@ -8,7 +8,7 @@ Công cụ phân tích tĩnh mã PHP nhằm hỗ trợ phát hiện luồng dữ
 
 - Phân tích cú pháp PHP bằng Tree-sitter.
 - Duyệt đệ quy toàn bộ thư mục dự án, bao gồm thư mục ẩn, `vendor/` và `node_modules/`; chỉ bỏ qua thư mục quản lý phiên bản (`.git`, `.svn`, `.hg`) và các thư mục được cấu hình loại trừ.
-- Theo dõi một số nguồn request tới `unserialize()`, `igbinary_unserialize()` và các thao tác filesystem có thể xử lý đường dẫn `phar://`.
+- Theo dõi một số nguồn request tới `unserialize()`, `igbinary_unserialize()`, `wddx_deserialize()` trên PHP cũ và các thao tác filesystem có thể xử lý đường dẫn `phar://`.
 - Nhận diện nội dung `file_get_contents($_FILES[*]['tmp_name'])` là dữ liệu upload; chính chuỗi đường dẫn tạm vẫn không được coi là payload. Báo cáo các phương thức có thể được gọi trên object deserialize đã lưu vào `$_SESSION`, cùng các sink và lớp ứng viên, dưới dạng bằng chứng có điều kiện.
 - Mô hình có điều kiện cho cookie và header `X-XSRF-TOKEN` của Laravel 5.6.29 qua `Encrypter::decrypt()`; báo cáo rõ kiểm tra MAC, `APP_KEY` và ràng buộc runtime chưa được xác minh.
 - Rà soát lời gọi `Phar::getMetadata()` và `PharFileInfo::getMetadata()` khi xác định được kiểu receiver; trên PHP 8+ bỏ qua tùy chọn literal `allowed_classes => false` hoặc danh sách rỗng.
@@ -17,7 +17,9 @@ Công cụ phân tích tĩnh mã PHP nhằm hỗ trợ phát hiện luồng dữ
 - Phát hiện ứng viên POP qua call graph, bao gồm magic methods và một số lời gọi động.
 - Luật YAML tích hợp và luật tùy chỉnh; kiểm tra bằng `verify-rules`.
 - Luật rà soát `session_decode()` gồm trường hợp nhận trực tiếp `$_GET`, `$_POST`, `$_COOKIE`, `$_REQUEST` và gợi ý INFO cho đầu vào khác. Kết quả cần xác minh `session.serialize_handler`, dữ liệu session và class được nạp.
+- Rà soát PECL YAML khi `yaml.decode_php` được bật, dữ liệu request đi trực tiếp vào `yaml_parse*()`, và lời gọi `unserialize()` trên các lớp SPL có kiểu receiver xác định. Đây là cảnh báo có điều kiện, không phải xác nhận khai thác.
 - Luật rà soát thao tác nguy hiểm trực tiếp trong `__unserialize()`; một khớp cú pháp không chứng minh có đường giải tuần tự hóa từ dữ liệu không tin cậy.
+- Rà soát callback `Serializable::unserialize()` khi lớp triển khai interface này và callback gọi trực tiếp thao tác nguy hiểm.
 - Báo cáo console, JSON, SARIF và HTML.
 - Tùy chọn thẩm định bằng LLM qua OpenAI, Gemini hoặc Ollama. Mặc định tắt.
 - Giới hạn kích thước tệp và số node AST tùy chọn; thống kê thời gian từng giai đoạn được ghi trong JSON.
@@ -83,7 +85,7 @@ Tùy chọn chính:
 | Tùy chọn | Tác dụng |
 | --- | --- |
 | `--library-mode` / `--application-mode` | Bật hoặc tắt phân tích tham số API công khai. Mặc định suy ra từ `composer.json` ở gốc; đây là giả định, không phải bằng chứng có request độc hại. |
-| `--php-version 7.4` | Cung cấp phiên bản runtime để đánh giá hành vi liên quan đến Phar. Bỏ qua tùy chọn này thì phiên bản là chưa xác định. |
+| `--php-version 7.4` | Cung cấp phiên bản PHP đích để đánh giá Phar, WDDX và nhánh `version_compare(PHP_VERSION, ...)` có điều kiện rõ ràng. Bỏ qua tùy chọn này thì phiên bản là chưa xác định. Đây là giả định cấu hình quét, không xác minh runtime triển khai. |
 | `--severity info` | Chọn mức thấp nhất được đưa vào báo cáo: `critical`, `high`, `medium`, `low`, `info`. |
 | `--max-file-mb N` | Bỏ qua tệp vượt giới hạn và đánh dấu lần quét chưa đầy đủ. Giá trị `0` là không giới hạn. |
 | `--max-ast-nodes N` | Giới hạn số node AST được duyệt trên mỗi tệp. Giá trị `0` là không giới hạn; không giới hạn bộ nhớ parser. |
@@ -141,6 +143,8 @@ Bộ máy hỗ trợ một tập con cú pháp Semgrep-like; đây không phải
 
 Các luật `session_decode` và `__unserialize` là luật **review**. Theo [tài liệu PHP về `session_decode()`](https://www.php.net/manual/en/function.session-decode.php), dữ liệu được giải mã bằng handler session đã cấu hình; [tài liệu magic methods](https://www.php.net/manual/en/language.oop5.magic.php) mô tả `__unserialize()` được gọi khi khôi phục object. Công cụ chưa dùng riêng các luật này để xác nhận khả năng khôi phục object, caller không tin cậy hoặc khai thác thực tế.
 
+Các luật mở rộng cho WDDX, PECL YAML và phương thức SPL được giải thích trong [bảng bao phủ và điều kiện runtime](docs/MO_RONG_BO_LUAT_DESERIALIZATION_2026_10_29.md). Bộ luật không thể bao trùm mọi thư viện và mọi cách gọi động; muốn xác nhận lỗ hổng cần đối chiếu luồng dữ liệu, cấu hình và gadget thực tế.
+
 ## Kiểm thử và kiểm tra nhanh
 
 ```powershell
@@ -170,6 +174,8 @@ php_deserial_sast/
 - `analysis.package_context` ghi tên, phiên bản và nguồn suy ra phiên bản. Đối chiếu advisory ngoại tuyến chỉ cung cấp ngữ cảnh phiên bản; phiên bản suy ra từ tên thư mục cần xác minh bằng nguồn phát hành. Tham chiếu gadget đã công bố và thuộc tính có thể điều khiển là bằng chứng hỗ trợ rà soát, không xác nhận đường khai thác.
 - POP chain là đường đi trong call graph tới thao tác nguy hiểm; chưa chứng minh dữ liệu deserialize kiểm soát được thuộc tính cần thiết hoặc đường đi thực thi được.
 - `metadata.deserialized_session_dispatch` liệt kê các ứng viên dispatch sau khi object được lưu vào session; `candidate_serialized_properties` là thuộc tính được tham chiếu trên đường gadget. Các trường này không xác minh thứ tự request, lớp được nạp hoặc thuộc tính thực sự do kẻ tấn công điều khiển.
+- Khi không có tệp cha `include`, tệp có lời gọi `session_start()` ở cấp cao nhất được xét như một điểm vào ứng viên. `session_bootstrap` có thể nối nó với điểm vào đọc session; vẫn không xác minh truy cập web, danh tính session hay thứ tự request.
+- Phân tích `include` giải các đường dẫn hằng từ chuỗi, `__DIR__`, `__FILE__`, `dirname(__FILE__)` và phép nối chuỗi; biểu thức phụ thuộc biến vẫn là `unknown`. `include` có điều kiện không được xem là bằng chứng lớp chắc chắn đã nạp. Xem [nâng cấp phân tích include](docs/NANG_CAP_PHAN_TICH_INCLUDE_2026_10_29.md).
 - Phar phụ thuộc phiên bản PHP và ngữ cảnh sử dụng wrapper. Hãy khai báo đúng phiên bản khi có thể.
 - Trên PHP 8+, mở archive không còn tự giải tuần tự hóa metadata, nhưng `getMetadata()` tường minh vẫn có thể làm vậy. Finding `php-phar-explicit-metadata-review` chỉ xác định thao tác có điều kiện; chưa chứng minh archive do kẻ tấn công kiểm soát. Luật dựa trên kiểu này chạy khi cả rules và taint analysis được bật.
 - Phân tích tĩnh có thể thiếu luồng qua alias/heap phức tạp, include động, callable động và hành vi riêng của framework. Không có finding không chứng minh mã an toàn.
@@ -220,12 +226,36 @@ phân biệt nội dung guard thay vì chỉ phân biệt có/không có guard; 
 giữa các tệp cũng giữ lại các bằng chứng này. Các đường đã bị xấp xỉ ở bước
 dataflow trước đó không được phục hồi tự động.
 
+Trường `routes` ở mức kết quả quét liên kết finding nguồn với các đường
+`source_to_sink`, `candidate_gadget` và `candidate_session_dispatch`. Mỗi
+đường có `route_id`, trạng thái `proven/conditional/unknown` và `missing_edges`;
+đường qua session ghi thêm vị trí store, trigger, lớp ứng viên và class loading.
+`proven` chỉ áp dụng cho cạnh tĩnh được mô hình hóa, không có nghĩa đã chạy
+payload. SARIF chứa tham chiếu route trong properties của finding nguồn.
+`analysis.route_evidence` ghi số route theo loại/trạng thái và số finding có
+flow hiển thị bị cắt. Các route được xuất là đại diện của bằng chứng giữ lại,
+không phải toàn bộ đường thực thi của ứng dụng.
+Class loading ghi `composer_autoload_candidate` khi bootstrap nạp
+`vendor/autoload.php` trước đường đang xét và khai báo PSR-4 trỏ đúng tệp lớp;
+đây vẫn là ứng viên có `class_loading_unverified`. File chỉ chứa
+`include/require` cũng được giữ cho phân tích entrypoint.
+Khi tìm sink từ method của object trong session chạm giới hạn độ sâu/số cạnh,
+finding ghi `session_dispatch_search_truncated` và assessment ở mức `limited`;
+danh sách sink lúc đó chưa đầy đủ.
+
 `assessment` tách mức tác động hiện có (`potential_impact`), loại bằng chứng
 (`evidence_level`) và giới hạn (`analysis_completeness`, `limitations`).
 `within_model` chỉ có nghĩa không ghi nhận giới hạn bổ sung trong mô hình hiện
 tại; không chứng minh bao phủ mọi hành vi PHP hoặc khai thác được. Guard chưa
 được chứng minh, nguồn giả định và lỗi scan được ghi rõ. `severity` và trace
 đại diện cũ vẫn tồn tại để tương thích với báo cáo trước.
+
+`assessment.review_priority` bổ sung điểm **ưu tiên rà soát tĩnh 0–100**,
+nhãn `LOW/MEDIUM/HIGH/URGENT`, phiên bản mô hình và bảng `factors` có thể cộng
+lại để kiểm tra điểm. Điểm dựa trên severity, loại bằng chứng, confidence,
+đường tới sink, giới hạn phân tích và phạm vi production/test/vendor. Nó không
+phải CVSS, xác suất khai thác hay bằng chứng runtime; không thay đổi severity,
+finding hoặc kết luận LLM. Xem [quy tắc chấm điểm](docs/CHAM_DIEM_UU_TIEN_RA_SOAT_2026_10_29.md).
 
 Rule engine chỉ nhận tập luật **search** được hỗ trợ: một `pattern` hoặc
 `pattern-either`, tùy chọn `pattern-not` và `pattern-inside`. Pattern là chuỗi
@@ -377,12 +407,14 @@ Công cụ hỗ trợ hợp đồng dispatch có điều kiện cho Drupal seria
 
 ### Cập nhật phân tích Laravel Encrypter
 
-Mô hình dispatch có điều kiện nối cookie và header `X-XSRF-TOKEN` qua middleware Laravel tới `Encrypter::decrypt()`. Lời gọi với đối số `$unserialize` literal `false` không tạo cạnh này. Báo cáo ghi rõ kiểm tra cấu trúc payload, MAC và điều kiện runtime chưa xác minh; finding không xác nhận khai thác. Xem [báo cáo kiểm chứng Laravel](docs/LARAVEL_DISPATCH_VA_DIEU_KIEN_2026_10_26.md).
+Mô hình dispatch có điều kiện nối cookie và header `X-XSRF-TOKEN` qua middleware Laravel tới `Encrypter::decrypt()`. Lời gọi với đối số `$unserialize` literal `false` không tạo cạnh này. Mô hình còn theo dõi helper tĩnh trả về thuộc tính `$serialize` mặc định: bản 5.6.30 tắt cookie serialization theo mặc định nên sink được hạ xuống Medium có điều kiện; lớp con bật lại cờ vẫn giữ High. Báo cáo ghi rõ kiểm tra cấu trúc payload, MAC và điều kiện runtime chưa xác minh; finding không xác nhận khai thác. Xem [đối chứng hai phiên bản](reports/evaluation/retest-2026-10-30-rule-alignment/LARAVEL_PATCH_ASSESSMENT.md).
 
 
 ### Side effects theo nhu cầu
 
-Khi bật `--experimental-side-effects`, chế độ mặc định chỉ tính summary side effects khi một phép đọc hoặc summary khác cần đến. `--eager-summaries` giữ chế độ tính toàn bộ để đối chiếu. Báo cáo JSON có `demanded_effect_functions`. Tối ưu này không loại bỏ luồng theo ngưỡng số lượng; các giới hạn về dispatch động và POP vẫn áp dụng.
+Khi bật `--experimental-side-effects`, chế độ mặc định chỉ tính summary side effects khi một phép đọc hoặc summary khác cần đến. `--eager-summaries` giữ chế độ tính toàn bộ để đối chiếu. Báo cáo JSON có `demanded_effect_functions`. Ngân sách `--max-side-effect-seconds` mặc định là 60 giây và `--max-side-effect-bindings` mặc định là 25.000 lần liên kết luồng trong lúc dựng summary; giá trị `0` tắt từng giới hạn. Nếu vượt một trong hai ngân sách, công cụ dựng lại taint summary ở chế độ mặc định, ghi lỗi `side_effect_budget` và trạng thái `budget_fallback` trong `analysis.interprocedural_side_effects`. Trường `attempted_bindings` cho biết số lần liên kết trước khi fallback. Khi đó finding không chứa chứng cứ side effects chưa hoàn tất; báo cáo có thể bỏ sót đường qua tham số tham chiếu, global hoặc property. Các giới hạn về dispatch động và POP vẫn áp dụng.
+
+Với truy vấn WordPress có bảng và cột tĩnh, báo cáo có thể ghi route `candidate_persistent_store` khi tìm thấy giá trị request được truyền trực tiếp vào `$wpdb->insert`, `$wpdb->update` hoặc `$wpdb->replace` cho cùng bảng và cột. Route này là ứng viên: quyền ghi, danh tính bản ghi và thứ tự hai request chưa được xác minh. Lời gọi `update_option` qua biến trung gian hoặc wrapper chưa được nối thành chứng cứ ghi.
 
 
 ### Kiểm thử Drupal sau sửa POP và bộ tham chiếu
