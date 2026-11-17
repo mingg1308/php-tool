@@ -18,6 +18,13 @@ class AtomicJSONTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), result.model_dump(mode="json"))
             self.assertEqual(list(Path(folder).glob("*.tmp")), [])
 
+    def test_creates_parent_directory(self):
+        result = ScanResult(target_path="fixture.php", summary=ScanSummary(), findings=[])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder, "reports", "chapter3_run", "xvwa.json")
+            JSONReporter().save_to_file(result, str(path))
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), result.model_dump(mode="json"))
+
     def test_failed_write_preserves_previous_report(self):
         result = ScanResult(target_path="fixture.php", summary=ScanSummary(), findings=[])
         with tempfile.TemporaryDirectory() as folder:

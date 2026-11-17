@@ -82,6 +82,13 @@ def receiver_class(engine, obj, use, namespace, seen=None):
     if key in seen or len(seen) >= 32:
         return ""
     seen.add(key)
+    # Parentheses preserve the receiver's value and type. Tree-sitter wraps
+    # `(new Decoder())->run()` in a parenthesized_expression, so resolve its
+    # sole inner expression before considering construction or aliases.
+    if obj.type == "parenthesized_expression":
+        if len(obj.named_children) != 1:
+            return ""
+        return receiver_class(engine, obj.named_children[0], use, namespace, seen)
     scope = engine.scope.get(use.id, -1)
     context = engine.functions.get(scope)
     if engine.text(obj) == "$this" and context:

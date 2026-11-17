@@ -10,6 +10,8 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from scripts.retest_case_studies import CASES as SCAN_CASES
 OUTPUT = ROOT / 'reports/evaluation/semgrep-reference-2026-10-26'
 CONFIG = ROOT / 'semgrep_php_deserialization.yml'
 CASES = (
@@ -28,23 +30,46 @@ CASES = (
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--only', choices=[name for name, _ in CASES])
+    parser.add_argument('--only', choices=[case[0] for case in SCAN_CASES])
+    parser.add_argument('--exclude', nargs='*', default=[], choices=[case[0] for case in SCAN_CASES],
+                        help='Skip already completed or deliberately excluded targets.')
     parser.add_argument('--timeout', type=int, default=900)
+    parser.add_argument('--all-cases', action='store_true',
+                        help='Include every testcase and CyberJutsu lab in the scanner retest runner.')
+    parser.add_argument('--docker', action='store_true',
+                        help='Use the pinned Semgrep image instead of the Windows launcher.')
+    parser.add_argument('--output', type=Path, help='Directory for JSON and command manifests.')
     parser.add_argument('--all-files', action='store_true',
                         help='Disable Semgrep ignore files for closer source coverage.')
     args = parser.parse_args()
-    output = (ROOT / 'reports/evaluation/semgrep-full-2026-10-26') if args.all_files else OUTPUT
+    output = args.output.resolve() if args.output else (
+        (ROOT / 'reports/evaluation/semgrep-full-2026-10-26') if args.all_files else OUTPUT)
     output.mkdir(parents=True, exist_ok=True)
     runs = []
-    for name, relative in CASES:
-        if args.only and name != args.only:
+    cases = tuple((case[0], case[1]) for case in SCAN_CASES) if args.all_cases else CASES
+    for name, relative in cases:
+        if (args.only and name != args.only) or name in args.exclude:
             continue
         report = output / (name + '.json')
-        command = [
-            'pysemgrep', 'scan', '--config', str(CONFIG), '--metrics=off',
-            '--no-git-ignore', '--max-target-bytes', '0', '--timeout', '60',
-            '--jobs', '2', '--json', '--output', str(report), str(ROOT / relative),
-        ]
+        target = (ROOT / relative).resolve()
+        if args.docker:
+            command = [
+                'docker', 'run', '--rm', '--network', 'none', '--cpus', '2',
+                '-e', 'SEMGREP_ENABLE_VERSION_CHECK=0',
+                '-e', 'SEMGREP_SEND_METRICS=off',
+                '--memory', '3g', '-v', f'{CONFIG}:/rules.yml:ro',
+                '-v', f'{output}:/out', '-v', f'{target}:/src:ro',
+                'semgrep/semgrep:1.180.0', 'semgrep', 'scan', '--config', '/rules.yml',
+                '--metrics=off', '--no-git-ignore', '--max-target-bytes', '0',
+                '--timeout', '60', '--jobs', '2', '--json', '--output',
+                f'/out/{name}.json', '/src',
+            ]
+        else:
+            command = [
+                'pysemgrep', 'scan', '--config', str(CONFIG), '--metrics=off',
+                '--no-git-ignore', '--max-target-bytes', '0', '--timeout', '60',
+                '--jobs', '2', '--json', '--output', str(report), str(target),
+            ]
         if args.all_files:
             command.insert(command.index('--max-target-bytes'), '--x-ignore-semgrepignore-files')
         print('START', name, flush=True)

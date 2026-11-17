@@ -177,6 +177,8 @@ class RouteEvidence(BaseModel):
     gadget_chain_id: Optional[str] = None
     entry_class: Optional[str] = None
     impact: Optional[CodeLocation] = None
+    impact_function: Optional[str] = None
+    impact_category: Optional[str] = None
     store: Optional[CodeLocation] = None
     trigger: Optional[CodeLocation] = None
     session_key: Optional[str] = None

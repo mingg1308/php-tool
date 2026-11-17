@@ -46,6 +46,13 @@ CASES = {
     "explode_separator_only": ("$v=explode($_GET['separator'], 'a:0:{}'); unserialize($v[0]);", False),
     "recursive_call": ("function a($s){b($s);} function b($s){if(rand())a($s); unserialize($s);} a($_GET['x']);", True),
     "typed_method": ("class Decoder {function load($x){unserialize($x);}} function endpoint(Decoder $d){$d->load($_GET['x']);}", True),
+    "parenthesized_new_receiver": ("class Decoder {function run($raw){return $this->decode($raw);} private function decode($raw){if(!is_string($raw)) return null; return unserialize($raw);}} $payload=$_GET['payload']; (new Decoder())->run($payload);", True),
+    "nested_parenthesized_new_receiver": ("class Decoder {function run($raw){unserialize($raw);}} ((new Decoder()))->run($_GET['x']);", True),
+    "parenthesized_alias_receiver": ("class Decoder {function run($raw){unserialize($raw);}} $d=new Decoder(); ($d)->run($_GET['x']);", True),
+    "parenthesized_new_constant": ("class Decoder {function run($raw){unserialize($raw);}} (new Decoder())->run('a:0:{}');", False),
+    "parenthesized_wrong_class": ("class Decoder {function run($raw){unserialize($raw);}} class Safe {function run($raw){}} (new Safe())->run($_GET['x']);", False),
+    "parenthesized_dynamic_factory": ("class Decoder {function run($raw){unserialize($raw);}} ($factory())->run($_GET['x']);", False),
+    "parenthesized_restricted_sink": ("class Decoder {function run($raw){unserialize($raw, ['allowed_classes'=>false]);}} (new Decoder())->run($_GET['x']);", False),
     "framework_request": ("use Symfony\\Component\\HttpFoundation\\Request; function endpoint(Request $r){unserialize($r->getContent());}", True),
     "ordinary_get_method": ("class Store {function get(){return 'a:0:{}';}} function endpoint(Store $s){unserialize($s->get());}", False),
 }

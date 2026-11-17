@@ -34,6 +34,10 @@ def main():
     parser.add_argument('--label', default='external')
     parser.add_argument('--projects', nargs='*')
     parser.add_argument('--target', type=Path, help='Additional explicitly selected fixture/source directory.')
+    parser.add_argument('--target-only', action='store_true',
+                        help='Scan only --target, without fixtures or testcase directories.')
+    parser.add_argument('--target-php-version', default='7.4',
+                        help='PHP version used by Psalm and Progpilot for --target.')
     parser.add_argument('--image', default='composer:2')
     parser.add_argument('--dependency-dir', type=Path, help='Additional dependency definitions for Psalm, mounted read-only.')
     parser.add_argument('--local-progpilot-source', action='store_true', help='Mount locally patched Progpilot sources over the reference image.')
@@ -45,6 +49,8 @@ def main():
         parser.error('--dependency-dir must exist')
     if args.timeout <= 0:
         parser.error('--timeout must be positive')
+    if args.target_only and not args.target:
+        parser.error('--target-only requires --target')
     output = ROOT / 'reports/evaluation' / args.label
     output.mkdir(parents=True, exist_ok=True)
     fixtures = output / 'fixtures'
@@ -56,15 +62,15 @@ def main():
         (fixtures / (name + '.php')).write_text('<?php\n' + code + '\n', encoding='utf-8')
     if args.fixtures_only and args.skip_fixtures:
         parser.error('--fixtures-only and --skip-fixtures cannot be combined')
-    targets = [] if args.skip_fixtures else [('fixtures', fixtures, '8.1')]
-    if not args.fixtures_only:
+    targets = [] if args.skip_fixtures or args.target_only else [('fixtures', fixtures, '8.1')]
+    if not args.fixtures_only and not args.target_only:
         dirs = sorted((ROOT / 'testcase').iterdir(), key=lambda p: (p.name not in {'xvwa','saloon-3.0.0','monolog-1.23.0','monolog'}, p.name))
         targets += [(p.name, p, '8.1' if p.name in {'saloon-3.0.0', 'monolog'} else '7.4') for p in dirs if p.is_dir() and (not args.projects or p.name in args.projects)]
     if args.target:
         target = args.target.resolve()
         if not target.is_dir():
             parser.error('--target must be a directory')
-        targets.append((target.name, target, '7.4'))
+        targets.append((target.name, target, args.target_php_version))
     metadata = {}
     for tool in ['codeql', 'psalm', 'progpilot']:
         p = subprocess.run(['git', '-C', str(ROOT / tool), 'rev-parse', 'HEAD'], capture_output=True, text=True)

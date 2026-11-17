@@ -35,6 +35,7 @@ class ScannerConfig(BaseModel):
     llm_provider: str = "openai"  # openai, gemini, ollama
     llm_model: Optional[str] = None
     llm_api_key: Optional[str] = None
+    llm_min_severity: Severity = Severity.HIGH
     min_severity: Severity = Severity.LOW
     max_chain_depth: int = 6
     exclude_dirs: List[str] = Field(default_factory=lambda: [".git", ".svn", ".hg", "vendor_disabled"])

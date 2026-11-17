@@ -31,6 +31,8 @@ CASES = (
     ("pokemon", r"D:\Học viện\cyberjutsu\php_object_injection\lJCBG1NQbW43d6D2IiFA_php_deserialization\pokemon", "7.3", False, ()),
     ("workshop-level1", r"D:\Học viện\cyberjutsu\php_object_injection\lJCBG1NQbW43d6D2IiFA_php_deserialization\php_deserialization_workshop\php_deserialization_workshop_level1", "7.3", False, ()),
     ("workshop-level2", r"D:\Học viện\cyberjutsu\php_object_injection\lJCBG1NQbW43d6D2IiFA_php_deserialization\php_deserialization_workshop\php_deserialization_workshop_level2", "7.3", False, ()),
+    ("workshop-level3", r"D:\Học viện\cyberjutsu\php_object_injection\lJCBG1NQbW43d6D2IiFA_php_deserialization\php_deserialization_workshop\php_deserialization_workshop_level3", "7.3", False, ()),
+    ("workshop-level4", r"D:\Học viện\cyberjutsu\php_object_injection\lJCBG1NQbW43d6D2IiFA_php_deserialization\php_deserialization_workshop\php_deserialization_workshop_level4", "7.3", False, ()),
 )
 PACKAGES = ('tree-sitter', 'tree-sitter-php', 'pyyaml', 'rich', 'pydantic',
             'click', 'jinja2', 'networkx', 'httpx')

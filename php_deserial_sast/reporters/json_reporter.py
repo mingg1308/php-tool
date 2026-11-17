@@ -19,6 +19,7 @@ class JSONReporter:
         # Serialize one record at a time and replace only a complete report.
         # A killed process must not truncate a previous valid destination.
         target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent,

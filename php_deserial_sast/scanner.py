@@ -26,6 +26,7 @@ from php_deserial_sast.core.taint_engine import TaintEngine, FLOW_EVIDENCE_LIMIT
 from php_deserial_sast.core.dataflow import FlowProject, SideEffectBudgetExceeded, arguments, expression
 from php_deserial_sast.core.evidence import assess_finding, compact_flow_evidence
 from php_deserial_sast.core.route_evidence import build_route_evidence
+from php_deserial_sast.core.impact_findings import build_rce_impact_findings
 from php_deserial_sast.core.control_flow import coverage as cfg_coverage
 from php_deserial_sast.core.finding_coverage import FindingCoverage
 from php_deserial_sast.core.pop_evidence import annotate_pop_candidates
@@ -68,6 +69,10 @@ class PHPDeserializationScanner:
                 api_key=self.config.llm_api_key,
                 symbol_table=self.symbol_table
             )
+
+    def _llm_eligible(self, finding: Finding) -> bool:
+        """Return whether a retained finding meets the configured LLM threshold."""
+        return finding.severity.rank >= self.config.llm_min_severity.rank
 
     def scan(self) -> ScanResult:
         """Run the complete multi-phase static analysis scan."""
@@ -369,8 +374,7 @@ class PHPDeserializationScanner:
         # Phase 5: LLM Verification (if enabled)
         if self.llm_verifier and filtered_findings:
             for finding in filtered_findings:
-                # Verify CRITICAL and HIGH findings
-                if finding.severity in (Severity.CRITICAL, Severity.HIGH):
+                if self._llm_eligible(finding):
                     verdict = self.llm_verifier.verify_finding(finding)
                     if verdict:
                         finding.llm_verification = verdict
@@ -399,7 +403,11 @@ class PHPDeserializationScanner:
                 finding.metadata["summary_evidence_truncated"] = True
             assess_finding(finding, errors)
 
-        routes = build_route_evidence(filtered_findings)
+        routes = build_route_evidence(filtered_findings, gadget_chains)
+        filtered_findings.extend(
+            finding for finding in build_rce_impact_findings(routes, filtered_findings)
+            if finding.severity.rank >= self.config.min_severity.rank
+        )
         phase_times["postprocess_and_evidence"] = time.perf_counter() - phase_start
 
         # Phase 6: Build Summary & Result
@@ -472,6 +480,7 @@ class PHPDeserializationScanner:
                                      "typed_dynamic_calls_unresolved": getattr(call_graph, "dynamic_calls_unresolved", 0),
                                      "dispatch_candidates_truncated": getattr(call_graph, "dispatch_candidates_truncated", 0)},
                       "llm_enabled": self.config.enable_llm,
+                      "llm_min_severity": self.config.llm_min_severity.value,
                       "dataflow": "use-site definitions with separate array fields; statement CFG pruning for supported scopes",
                       "interprocedural_side_effects": {"enabled": bool(flow_project and flow_project.experimental_side_effects),
                           "requested": self.config.experimental_side_effects,

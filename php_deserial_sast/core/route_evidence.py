@@ -16,8 +16,9 @@ def _identity(parts):
     return 'ROUTE-' + hashlib.sha256(encoded).hexdigest()[:16]
 
 
-def build_route_evidence(findings):
+def build_route_evidence(findings, gadget_chains=()):
     routes = {}
+    chains_by_id = {chain.chain_id: chain for chain in gadget_chains}
     for finding in findings:
         if finding.metadata.get('engine') != 'taint':
             continue
@@ -94,6 +95,7 @@ def build_route_evidence(findings):
             impact = link.get('impact_site')
             if not chain_id or not impact:
                 continue
+            chain = chains_by_id.get(chain_id)
             identity = [finding.id, finding.location.model_dump(), chain_id,
                         link.get('entry_class'), impact]
             missing = list(link.get('runtime_conditions_unverified', ()))
@@ -104,6 +106,8 @@ def build_route_evidence(findings):
                 sink=finding.location, gadget_chain_id=chain_id,
                 entry_class=link.get('entry_class'),
                 impact=CodeLocation.model_validate(impact),
+                impact_function=link.get('impact_function'),
+                impact_category=chain.sink_type if chain else None,
                 missing_edges=missing,
             )
             routes[route.route_id] = route
@@ -142,6 +146,8 @@ def build_route_evidence(findings):
                             sink=finding.location,
                             entry_class=candidate.get('class'),
                             impact=CodeLocation.model_validate(impact_location),
+                            impact_function=impact.get('function'),
+                            impact_category=impact.get('category'),
                             store=CodeLocation.model_validate(store),
                             trigger=CodeLocation.model_validate(trigger),
                             session_key=str(row.get('session_key')),

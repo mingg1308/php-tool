@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from php_deserial_sast.config import ScannerConfig
 from php_deserial_sast.llm.verifier import LLMVerifier
@@ -14,6 +14,54 @@ from php_deserial_sast.scanner import PHPDeserializationScanner
 
 
 class LLMIntegrationTests(unittest.TestCase):
+    def test_medium_finding_is_eligible_when_configured(self):
+        finding = MagicMock()
+        finding.severity = Severity.MEDIUM
+        medium_scanner = PHPDeserializationScanner(ScannerConfig(
+            target_path='.', enable_llm=False, llm_min_severity=Severity.MEDIUM,
+        ))
+        high_scanner = PHPDeserializationScanner(ScannerConfig(
+            target_path='.', enable_llm=False, llm_min_severity=Severity.HIGH,
+        ))
+        self.assertTrue(medium_scanner._llm_eligible(finding))
+        self.assertFalse(high_scanner._llm_eligible(finding))
+
+    def test_gemini_http_response_is_read_without_proxy(self):
+        response = MagicMock()
+        response.json.return_value = {"candidates": [{"content": {"parts": [{"text": '{"ok":true}'}]}}]}
+        client = MagicMock()
+        client.post.return_value = response
+        context = MagicMock()
+        context.__enter__.return_value = client
+        with patch("php_deserial_sast.llm.verifier.httpx.Client", return_value=context) as factory:
+            raw = LLMVerifier(provider="gemini", api_key="test-only-key")._call_gemini("test prompt")
+        self.assertEqual(raw, '{"ok":true}')
+        self.assertFalse(factory.call_args.kwargs["trust_env"])
+        self.assertEqual(client.post.call_args.kwargs["headers"]["x-goog-api-key"], "test-only-key")
+
+    def test_gemini_retries_transient_service_error(self):
+        unavailable = MagicMock()
+        unavailable.status_code = 503
+        unavailable.headers = {}
+        success = MagicMock()
+        success.status_code = 200
+        success.headers = {}
+        success.json.return_value = {"candidates": [{"content": {"parts": [{"text": '{"ok":true}'}]}}]}
+        client = MagicMock()
+        client.post.side_effect = [unavailable, success]
+        context = MagicMock()
+        context.__enter__.return_value = client
+        with patch.dict(os.environ, {
+            "GEMINI_MAX_ATTEMPTS": "2",
+            "GEMINI_RETRY_BASE_SECONDS": "0",
+            "GEMINI_MIN_INTERVAL_SECONDS": "0",
+        }), patch("php_deserial_sast.llm.verifier.httpx.Client", return_value=context), \
+                patch("php_deserial_sast.llm.verifier.time.sleep") as sleeper:
+            raw = LLMVerifier(provider="gemini", api_key="test-only-key")._call_gemini("test prompt")
+        self.assertEqual(raw, '{"ok":true}')
+        self.assertEqual(client.post.call_count, 2)
+        sleeper.assert_called_once_with(0.0)
+
     def scan(self, mocked_response):
         with tempfile.TemporaryDirectory() as parent:
             source = Path(parent) / 'case.php'

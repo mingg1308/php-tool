@@ -66,6 +66,7 @@ def main():
 @click.option("--llm/--no-llm", default=False, help="Enable LLM verification for False Positive filtering.")
 @click.option("--llm-provider", type=click.Choice(["openai", "gemini", "ollama"], case_sensitive=False), default="openai", help="LLM Provider.")
 @click.option("--llm-model", type=str, default=None, help="Model name for LLM verification.")
+@click.option("--llm-min-severity", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"], case_sensitive=False), default="HIGH", show_default=True, help="Minimum finding severity sent to the LLM. The finding must also pass --severity.")
 @click.option("--max-depth", type=int, default=6, help="Maximum POP chain graph search depth.")
 @click.option("--max-gadget-paths", type=click.IntRange(min=1), default=10000, help="Maximum sink paths examined by POP analysis; reaching the limit marks the scan incomplete.")
 @click.option("--max-gadget-expansions", type=click.IntRange(min=1), default=250000, help="Maximum call-graph edges traversed by POP analysis; reaching the limit marks the scan incomplete.")
@@ -92,6 +93,7 @@ def scan_cmd(
     llm,
     llm_provider,
     llm_model,
+    llm_min_severity,
     max_depth,
     max_gadget_paths,
     max_gadget_expansions,
@@ -116,6 +118,7 @@ def scan_cmd(
         enable_llm=llm,
         llm_provider=llm_provider,
         llm_model=llm_model,
+        llm_min_severity=Severity(llm_min_severity.upper()),
         min_severity=Severity(severity.upper()),
         max_chain_depth=max_depth,
         max_gadget_paths=max_gadget_paths,
